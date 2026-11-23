@@ -1,7 +1,17 @@
 {
   "name": "cursor-run",
   "private": true,
-  "version": "0.3.0",
-  "scripts": { "start": "node server.js", "test": "node test.js" },
-  "dependencies": { "ws": "^8.18.0" }
+  "version": "0.4.0",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js && node pieces.test.js && node daily.test.js && node board.test.js && node e2e.js && node smoke.js",
+    "shots": "node scripts/shots.js",
+    "build": "node scripts/build-artifact.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.65.1"
+  }
 }
