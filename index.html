@@ -25,6 +25,18 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:
 #msg .res{display:inline-grid;grid-template-columns:auto auto;gap:2px 18px;margin-top:10px;font-size:15px;text-align:left;font-variant-numeric:tabular-nums}
 #msg .medal{display:inline-block;margin-top:8px;padding:4px 14px;border-radius:999px;font-weight:700;letter-spacing:.1em}
 #keys{position:fixed;right:max(14px,env(safe-area-inset-right,0px));top:max(10px,env(safe-area-inset-top,0px));color:var(--dim);font-size:12px;font-weight:500;text-align:right;pointer-events:none;line-height:1.5}
+[hidden]{display:none!important}
+/* 名前入力と共有テキストの小窓。ここだけは普通のカーソルで操作する */
+#overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(7,9,15,.72);z-index:5;padding-inline:max(16px,env(safe-area-inset-left,0px)) max(16px,env(safe-area-inset-right,0px))}
+#overlay .box{background:var(--card);border:2px solid var(--wall-edge);border-radius:10px;padding:20px 22px;display:flex;flex-direction:column;gap:12px;width:min(440px,100%);box-sizing:border-box}
+#overlay label{font-weight:700;letter-spacing:.06em}
+#overlay input,#overlay textarea{font:inherit;font-size:18px;color:var(--fg);background:var(--bg);border:2px solid var(--wall-edge);border-radius:6px;padding:8px 10px;min-width:0}
+#overlay textarea{font-size:14px;font-weight:500;height:132px;resize:none;line-height:1.5}
+#overlay .row{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+#overlay button{font:inherit;font-weight:700;color:var(--fg);background:var(--card-hi);border:2px solid var(--wall-edge);border-radius:6px;padding:8px 16px;cursor:pointer}
+#overlay button.go{border-color:var(--start);color:var(--start)}
+#overlay :focus-visible{outline:2px solid var(--player);outline-offset:2px}
+#toast{position:fixed;left:50%;top:max(14px,env(safe-area-inset-top,0px));transform:translateX(-50%);background:var(--card);border:2px solid var(--start);border-radius:999px;padding:6px 18px;font-weight:700;font-size:14px;pointer-events:none;z-index:6;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -35,8 +47,17 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:
   <div class="dim" id="hLine3">DEATHS <span id="hDeaths">0</span> · BEST <span id="hBest">--</span></div>
   <div class="dim" id="hDbg" hidden></div>
 </div>
-<div id="keys">R リスタート · M メニュー · G ゴースト · D デバッグ</div>
+<div id="keys"></div>
 <div id="msg"></div>
+<div id="toast" hidden></div>
+<div id="overlay" hidden>
+  <form class="box" id="ovForm">
+    <label for="ovName" id="ovLabel"></label>
+    <input id="ovName" maxlength="12" autocomplete="off" spellcheck="false">
+    <textarea id="ovText" readonly hidden></textarea>
+    <div class="row"><button type="button" id="ovCancel">閉じる</button><button type="submit" class="go" id="ovOk">決定</button></div>
+  </form>
+</div>
 <script>
 'use strict';
 // ===================== 調整値 =====================
@@ -361,20 +382,459 @@ function sweepHit(ps, ax, ay, bx, by){
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
 
+// ===================== ソルバー（デイリーの検証・パー計算・BOTゴースト） =====================
+// ハザードは時刻の純関数なので、格子上の「到達できるセルの集合」を1ステップずつ広げるだけで最短時間が出る。
+// 移動の条件: 行き先は移動前後の両時刻で空き、出発元も移動後の時刻で空き（動く障害物とのすれ違いを防ぐ）。
+const SV = { G: 16, V: 500, M: 16, HORIZON: 25, PAD_SAFE: 50, GOAL_R: 34 }; // セル幅px / BOT速度px/s / 余白px / 打ち切り秒 / パッドの安全半径 / ゴール判定半径
+function solveRoom(room, from, exit, t0, wantPath, horizon, prof){
+  const P = prof || SV, g = SV.G, nx = Math.ceil(T.W / g), ny = Math.ceil(T.H / g), n = nx * ny, dt = g / P.V, m = P.M;
+  const paint = (buf, ps) => {
+    for (const pr of ps){
+      if (pr.on === false) continue;
+      const rr = (pr.k === 'rect' ? 0 : pr.r) + m;
+      const x0 = pr.k === 'rect' ? pr.x - m : pr.k === 'circ' ? pr.x - rr : Math.min(pr.ax, pr.bx) - rr, x1 = pr.k === 'rect' ? pr.x + pr.w + m : pr.k === 'circ' ? pr.x + rr : Math.max(pr.ax, pr.bx) + rr;
+      const y0 = pr.k === 'rect' ? pr.y - m : pr.k === 'circ' ? pr.y - rr : Math.min(pr.ay, pr.by) - rr, y1 = pr.k === 'rect' ? pr.y + pr.h + m : pr.k === 'circ' ? pr.y + rr : Math.max(pr.ay, pr.by) + rr;
+      const i0 = Math.max(0, Math.ceil((x0 - g / 2) / g)), i1 = Math.min(nx - 1, Math.floor((x1 - g / 2) / g)), j0 = Math.max(0, Math.ceil((y0 - g / 2) / g)), j1 = Math.min(ny - 1, Math.floor((y1 - g / 2) / g));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++){ if (pr.k === 'rect' || hit(pr, i * g + g / 2, j * g + g / 2, i * g + g / 2, j * g + g / 2, m)) buf[j * nx + i] = 1; }
+    }
+  };
+  const base = new Uint8Array(n);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++){ const cx = i * g + g / 2, cy = j * g + g / 2; if (cx < m || cy < m || cx > T.W - m || cy > T.H - m) base[j * nx + i] = 1; }
+  paint(base, prims({ pieces: room.pieces.filter(p => p.t === 'wall') }, 0));
+  const dyn = { pieces: room.pieces.filter(p => p.t !== 'wall') };
+  const block = t => { const b = base.slice(); paint(b, prims(dyn, t)); return b; };
+  const cell = p => Math.min(ny - 1, Math.max(0, Math.floor(p.y / g))) * nx + Math.min(nx - 1, Math.max(0, Math.floor(p.x / g)));
+  const goals = []; for (let c = 0; c < n; c++){ const cx = (c % nx) * g + g / 2, cy = Math.floor(c / nx) * g + g / 2; if (!base[c] && Math.hypot(cx - exit.x, cy - exit.y) < SV.GOAL_R) goals.push(c); }
+  let blkA = block(t0), reach = new Uint8Array(n); const s0 = cell(from);
+  if (blkA[s0] || !goals.length) return { ok: false };
+  reach[s0] = 1;
+  const steps = Math.ceil((horizon || SV.HORIZON) / dt), hist = [], src = new Uint8Array(n);
+  for (let k = 1; k <= steps; k++){
+    const blkB = block(t0 + k * dt), next = new Uint8Array(n);
+    for (let c = 0; c < n; c++) src[c] = reach[c] && !blkB[c] ? 1 : 0;
+    for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++){ const c = j * nx + i; if (blkA[c] || blkB[c]) continue;
+      if (src[c] || src[c - 1] || src[c + 1] || src[c - nx] || src[c + nx] || src[c - nx - 1] || src[c - nx + 1] || src[c + nx - 1] || src[c + nx + 1]) next[c] = 1; }
+    if (wantPath) hist.push(src.slice());
+    reach = next; blkA = blkB;
+    const gc = goals.find(c => next[c]);
+    if (gc !== undefined){
+      const res = { ok: true, time: k * dt };
+      if (wantPath){ // 逆にたどる。「早めに進んで手前で待つ」形にし、動くときは同じ向きを優先する
+        const cells = [gc]; let c = gc, pd = 0;
+        for (let q = k; q >= 1; q--){ const sr = hist[q - 1];
+          if (!sr[c]){ let nb = pd && sr[c + pd] ? c + pd : -1;
+            if (nb < 0) for (const dlt of [-1, 1, -nx, nx, -nx - 1, -nx + 1, nx - 1, nx + 1]) if (sr[c + dlt]){ nb = c + dlt; pd = dlt; break; }
+            c = nb; }
+          cells.push(c); }
+        cells.reverse();
+        res.path = cells.map((cc, q) => ({ x: (cc % nx) * g + g / 2, y: Math.floor(cc / nx) * g + g / 2, t: t0 + q * dt }));
+      }
+      return res;
+    }
+  }
+  return { ok: false };
+}
+// パッドが「どの時刻でも」安全か。各ピースの届く範囲（最悪ケースの形）と比べるので時刻を回さない。
+function padSafe(pieces, c, rad){
+  const rc = b => !rectCircleClear(b, c, rad), ci = (x, y, r) => Math.hypot(c.x - x, c.y - y) <= r + rad;
+  for (const p of pieces){
+    switch (p.t){
+      case 'wall': case 'blink': case 'warnfloor': case 'slider': case 'slidelaser': case 'crusher': case 'rain': if (rc(bounds(p))) return false; break;
+      case 'bar': if (ci(p.x, p.y, (p.anchor === 'end' ? p.len : p.len / 2) + p.thick / 2)) return false; break;
+      case 'stretch': if (ci(p.x, p.y, p.lmax / 2 + p.thick / 2)) return false; break;
+      case 'pulser': if (ci(p.x, p.y, p.rmax)) return false; break;
+      case 'rotlaser': if (ci(p.x, p.y, p.len + p.thick / 2)) return false; break;
+      case 'orbit': { const d = Math.hypot(c.x - p.x, c.y - p.y); if (!(d + rad < p.R - p.r || d - rad > p.R + p.r)) return false; break; }
+      case 'gate': if (segPointDist(p.ax, p.ay, p.bx, p.by, c.x, c.y) <= p.thick / 2 + rad) return false; break;
+      case 'shooter': if (segPointDist(p.x, p.y, p.x + p.dx * p.range, p.y + p.dy * p.range, c.x, c.y) <= p.r + rad) return false; break;
+      default: return false; // 状態を持つピースは対象外（デイリーでは使わない）
+    }
+  }
+  return true;
+}
+
+// ===================== デイリーコース生成 =====================
+// 日付(JST)をシードに部屋の型を選んでパラメータを振り、ソルバーで「必ず通れる」ことを確かめてから採用する。
+// 生成結果が変わる変更をしたら GEN_VER を上げる（ランキングのキーに入っているので、古い記録と混ざらない）。
+const GEN_VER = 'g1';
+const DAILY = {
+  EPOCH: '2026-11-23',          // この日が #1
+  TZ_MIN: 540,                  // 日付の切り替えは JST 0:00
+  ROOMS: 5,
+  TIER_BY_DOW: [2, 0, 0, 1, 1, 1, 2], // 日月火水木金土 → 0 EASY / 1 NORMAL / 2 HARD
+  TIER_NAME: ['EASY', 'NORMAL', 'HARD'], TIER_D: [0.2, 0.5, 0.8],
+  // メダル秒数。BOTは完璧なので「BOT時間 × 難度係数」を部屋ごとに足して GOLD とする。
+  // 係数 = A + B·d³（手作り3コースの GOLD 20/40/45 秒に合うよう決めた暫定値）。SILVER/BRONZE は GOLD の倍率
+  MEDAL: { A: 1.6, B: 3.4, SILVER: 1.5, BRONZE: 2.25 },
+  ROOM_LIMIT: [9, 15],          // 1部屋のBOT時間の上限（難度0→1）
+};
+function xmur3(str){ let h = 1779033703 ^ str.length; for (let i = 0; i < str.length; i++){ h = Math.imul(h ^ str.charCodeAt(i), 3432918353); h = h << 13 | h >>> 19; } return () => { h = Math.imul(h ^ h >>> 16, 2246822507); h = Math.imul(h ^ h >>> 13, 3266489909); return (h ^= h >>> 16) >>> 0; }; }
+function RNG(seed){
+  let a = xmur3(seed)();
+  const r = () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  return { f: (lo, hi) => lo + r() * (hi - lo), i: (lo, hi) => lo + Math.floor(r() * (hi - lo + 1)), pick: arr => arr[Math.floor(r() * arr.length)], chance: p => r() < p, sign: () => r() < 0.5 ? -1 : 1,
+    shuffle(arr){ for (let i = arr.length - 1; i > 0; i--){ const j = Math.floor(r() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; } };
+}
+function fnv(str){ let h = 0x811c9dc5; for (let i = 0; i < str.length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(16).padStart(8, '0'); }
+const ri = Math.round, r2 = v => Math.round(v * 100) / 100, clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+// 部屋は「左から右へ」の向きで書き、F で左右・上下を反転して置く
+function frame(dir, flip){
+  const X = x => dir > 0 ? x : T.W - x, Y = y => flip ? T.H - y : y;
+  return { dir, sy: flip ? -1 : 1, X, Y, pt: (x, y) => ({ x: X(x), y: Y(y) }), rect: (x, y, w, h) => ({ x: dir > 0 ? x : T.W - x - w, y: flip ? T.H - y - h : y, w, h }) };
+}
+// 部屋の型。(R 乱数, d 難度0..1, F 向き) → { cps, pieces }
+const ARCH = {
+  ZIGZAG(R, d, F){
+    const L = (a, b) => a + (b - a) * d, n = d < 0.35 ? 3 : d < 0.75 ? 4 : 5, gap = ri(L(250, 150)), w = 34, pieces = [], xs = [], lane = 740 / (n - 1) - w, k = n >> 1;
+    for (let i = 0; i < n; i++){ const x = ri(270 + i * 740 / (n - 1)); xs.push(x); pieces.push({ t: 'wall', ...F.rect(x - w / 2, i % 2 ? gap : 0, w, T.H - gap) }); }
+    for (let i = 0; i < n - 1; i++) if (R.chance(d * 1.1)) pieces.push({ t: 'orbit', ...F.pt((xs[i] + xs[i + 1]) / 2, 360), R: ri(Math.min(L(55, 80), lane / 2 - 28)), r: 14, rpm: ri(R.sign() * L(35, 62)), phase: r2(R.f(0, 1)) });
+    for (const i of [0, n - 1]) if (i !== k && R.chance(d - 0.35)) pieces.push({ t: 'pulser', ...F.pt(xs[i], i % 2 ? gap / 2 : T.H - gap / 2), rmin: 10, rmax: ri(gap / 2 - 24), period: r2(R.f(1.5, 2.1)), phase: r2(R.f(0, 1)) });
+    return { cps: [F.pt(xs[k], k % 2 ? gap / 2 : T.H - gap / 2)], pieces };
+  },
+  SLIDERS(R, d, F){
+    const L = (a, b) => a + (b - a) * d, n = d < 0.5 ? 3 : 4, h = ri(L(190, 250)), pieces = [], xs = [];
+    for (let i = 0; i < n; i++){ const x = ri(300 + i * 480 / (n - 1)); xs.push(x); pieces.push({ t: 'slider', ...F.rect(x - 22, 0, 44, h), dy: F.sy * (T.H - h), period: r2(R.f(L(2.9, 2.0), L(2.5, 1.7))), phase: r2(R.f(0, 1)) }); }
+    if (d > 0.3) pieces.push({ t: 'orbit', ...F.pt(980, 360), R: ri(L(90, 115)), r: 20, rpm: ri(R.sign() * L(32, 48)), phase: r2(R.f(0, 1)) });
+    return { cps: [F.pt((xs[1] + xs[2]) / 2, 360)], pieces };
+  },
+  SPIN(R, d, F){
+    const L = (a, b) => a + (b - a) * d, a = R.sign() * L(17, 30) * R.f(0.9, 1.1), len = ri(L(330, 420)), tri = d > 0.65 && R.chance(0.5);
+    const pieces = [{ t: 'bar', ...F.pt(360, 360), len, thick: 16, rpm: r2(a), phase: r2(R.f(0, 1)) },
+      tri ? { t: 'bar', ...F.pt(920, 360), len, thick: 14, rpm: r2(-a * 0.6), phase: r2(R.f(0, 1)), blades: 3 } : { t: 'bar', ...F.pt(920, 360), len, thick: 16, rpm: r2(-a * R.f(0.9, 1.2)), phase: r2(R.f(0, 1)) }];
+    const per = r2(R.f(1.8, 2.4)), rmax = ri(L(75, 110));
+    pieces.push({ t: 'pulser', ...F.pt(640, 125), rmin: 22, rmax, period: per, phase: 0 }, { t: 'pulser', ...F.pt(640, 595), rmin: 22, rmax, period: per, phase: 0.5 });
+    return { cps: [F.pt(640, 360)], pieces };
+  },
+  GAUNTLET(R, d, F){
+    const L = (a, b) => a + (b - a) * d, c = ri(L(85, 56)), xs = d < 0.4 ? [370, 520, 880] : d < 0.8 ? [360, 500, 800, 940] : [350, 460, 570, 790, 930];
+    const per = r2(L(1.7, 1.15)), duty = r2(L(0.45, 0.55)), st = R.pick([0.25, 0.33, 0.5]), p0 = R.f(0, 1), h = ri(L(170, 230)), rmax = ri(L(70, 95));
+    const pieces = [{ t: 'wall', ...F.rect(300, 0, 680, 360 - c) }, { t: 'wall', ...F.rect(300, 360 + c, 680, 360 - c) }];
+    xs.forEach((x, i) => pieces.push({ t: 'gate', ax: F.X(x), ay: 360 - c, bx: F.X(x), by: 360 + c, thick: 8, period: per, duty, phase: r2((p0 + i * st) % 1) }));
+    pieces.push({ t: 'slider', ...F.rect(205, 0, 30, h), dy: F.sy * (T.H - h), period: r2(L(2.4, 1.7)), phase: r2(R.f(0, 1)) });
+    pieces.push({ t: 'pulser', ...F.pt(1070, 165), rmin: 18, rmax, period: 1.8, phase: 0 }, { t: 'pulser', ...F.pt(1070, 555), rmin: 18, rmax, period: 1.8, phase: 0.5 });
+    return { cps: [F.pt(650, 360)], pieces };
+  },
+  CROSSFIRE(R, d, F){
+    const L = (a, b) => a + (b - a) * d, n = ri(L(5, 9)), lanes = R.shuffle([250, 320, 390, 460, 530, 750, 820, 890, 960, 1030]).slice(0, n), pieces = [];
+    lanes.forEach((x, i) => { const top = (i + (R.chance(0.3) ? 1 : 0)) % 2 === 0; pieces.push({ t: 'shooter', x: F.X(x), y: top ? -30 : 750, dx: 0, dy: top ? 1 : -1, speed: ri(L(350, 470) * R.f(0.95, 1.05)), interval: r2(R.f(L(1.05, 0.8), L(0.95, 0.72))), r: 12, range: 780, phase: r2(R.f(0, 1)) }); });
+    if (d > 0.7) for (const y of R.chance(0.5) ? [150] : [150, 570]){ const left = R.chance(0.5); pieces.push({ t: 'shooter', x: left ? -20 : 1300, y, dx: left ? 1 : -1, dy: 0, speed: 500, interval: 0.8, r: 10, range: 1000, phase: r2(R.f(0, 1)) }); }
+    return { cps: [F.pt(640, 360)], pieces };
+  },
+  SWEEP(R, d, F){
+    const L = (a, b) => a + (b - a) * d, len = ri(L(470, 570)), a = R.sign() * L(8.5, 13.5), rmax = ri(L(55, 80));
+    return { cps: [], pieces: [
+      { t: 'bar', x: 640, y: 0, len, thick: 14, rpm: r2(a), phase: r2(R.f(0, 1)), anchor: 'end' }, { t: 'bar', x: 640, y: 720, len, thick: 14, rpm: r2(R.chance(0.5) ? a : -a), phase: r2(R.f(0, 1)), anchor: 'end' },
+      { t: 'pulser', x: 640, y: 205, rmin: 18, rmax, period: 2, phase: 0 }, { t: 'pulser', x: 640, y: 515, rmin: 18, rmax, period: 2, phase: 0.5 }] };
+  },
+  BLINK(R, d, F){
+    const L = (a, b) => a + (b - a) * d, cols = d < 0.4 ? [300, 470, 810, 980] : [270, 400, 530, 750, 880, 1010], per = r2(L(2.0, 1.3)), p0 = R.f(0, 1), pieces = [];
+    cols.forEach((x, i) => [0, 240, 480].forEach((y, j) => pieces.push({ t: 'blink', x: F.X(x) - 30, y, w: 60, h: 240, period: per, duty: 0.5, phase: r2((p0 + ((i + j) % 2) * 0.5) % 1) })));
+    return { cps: [F.pt(640, 360)], pieces };
+  },
+  ORBITAL(R, d, F){
+    const L = (a, b) => a + (b - a) * d, rings = d < 0.4 ? [[120, 2, 30], [230, 3, -22]] : [[120, 2, 30], [200, 3, -24], [280, 4, 18]], k = L(0.8, 1.25) * R.sign(), pieces = [];
+    for (const [RR, cnt, rpm] of rings){ const p0 = R.f(0, 1); for (let j = 0; j < cnt; j++) pieces.push({ t: 'orbit', x: 640, y: 360, R: RR, r: 20, rpm: r2(rpm * k), phase: r2((p0 + j / cnt) % 1) }); }
+    const wh = 360 - (rings[rings.length - 1][0] + 20) - 14; // 縁を這って輪を全部よける抜け道を塞ぐ
+    if (wh > 20) pieces.push({ t: 'wall', x: 625, y: 0, w: 30, h: wh }, { t: 'wall', x: 625, y: T.H - wh, w: 30, h: wh });
+    if (d > 0.3){ const rmax = ri(L(55, 80)); pieces.push({ t: 'pulser', ...F.pt(300, 100), rmin: 16, rmax, period: 1.8, phase: 0 }, { t: 'pulser', ...F.pt(980, 620), rmin: 16, rmax, period: 1.8, phase: 0.5 }); }
+    return { cps: [{ x: 640, y: 360 }], pieces };
+  },
+  THREAD(R, d, F){
+    const L = (a, b) => a + (b - a) * d, c = ri(L(78, 50)), n = d < 0.5 ? 3 : 4, s = R.sign();
+    const pieces = [{ t: 'wall', x: 200, y: 0, w: 880, h: 360 - c }, { t: 'wall', x: 200, y: 360 + c, w: 880, h: 360 - c }];
+    for (let i = 0; i < n; i++) pieces.push({ t: 'orbit', x: ri(380 + i * 520 / (n - 1)), y: 360, R: ri(c * 0.42), r: 6, rpm: ri((i % 2 ? -s : s) * L(60, 95)), phase: r2(R.f(0, 1)) });
+    return { cps: [], pieces };
+  },
+  RAIN(R, d, F){
+    const L = (a, b) => a + (b - a) * d, bands = d < 0.4 ? [[640, 160]] : [[250, 160], [640, 160], [880, 160]];
+    const pieces = [{ t: 'wall', ...F.rect(430, 0, 34, T.H - 230) }, { t: 'wall', ...F.rect(820, 230, 34, T.H - 230) }];
+    for (const [x, w] of bands) pieces.push({ t: 'rain', x: F.rect(x, 0, w, 0).x, w, interval: r2(L(0.2, 0.1)), speed: ri(L(250, 340)), r: 6, seed: R.i(1, 99) });
+    if (d > 0.55) pieces.push({ t: 'orbit', ...F.pt(552, 600), R: 60, r: 14, rpm: ri(R.sign() * 45), phase: r2(R.f(0, 1)) });
+    return { cps: [F.pt(552, 360)], pieces };
+  },
+  CRUSH(R, d, F){
+    const L = (a, b) => a + (b - a) * d, w = ri(L(140, 180)), gap = ri(L(100, 64)), travel = ri(L(150, 120)), pieces = []; let py = 360;
+    for (const x of [280, 560, 840]){ const y = R.pick([200, 360, 520].filter(v => v !== py)); py = y; pieces.push({ t: 'crusher', x: F.rect(x, 0, w, 0).x, y, w, h: 2 * Math.max(y, T.H - y), gap, travel, period: r2(R.f(L(2.8, 2.0), L(2.4, 1.7))), phase: r2(R.f(0, 1)) }); }
+    return { cps: [F.pt((560 + w + 840) / 2, 360)], pieces };
+  },
+  LASERS(R, d, F){
+    const L = (a, b) => a + (b - a) * d, dx = ri(L(520, 760));
+    const pieces = [{ t: 'rotlaser', x: 640, y: 360, len: ri(L(380, 460)), rpm: r2(R.sign() * L(5, 8.5)), thick: 10, on: r2(L(1.4, 2.0)), warn: 0.7, off: r2(L(1.7, 1.2)), phase: r2(R.f(0, 1)) },
+      { t: 'slidelaser', x: 640, y: 105, len: 210, dx, period: r2(R.f(L(3.4, 2.4), L(3.0, 2.1))), thick: 8, phase: r2(R.f(0, 1)) }, { t: 'slidelaser', x: 640, y: 615, len: 210, dx, period: r2(R.f(L(3.4, 2.4), L(3.0, 2.1))), thick: 8, phase: r2(R.f(0, 1)) }];
+    if (d > 0.5){ const per = r2(L(3.4, 2.6)); pieces.push({ t: 'warnfloor', ...F.rect(330, 270, 150, 180), period: per, duty: 0.3, warn: 0.6, phase: 0 }, { t: 'warnfloor', ...F.rect(800, 270, 150, 180), period: per, duty: 0.3, warn: 0.6, phase: 0.5 }); }
+    return { cps: [], pieces };
+  },
+  STRETCH(R, d, F){
+    const L = (a, b) => a + (b - a) * d, lmax = ri(L(380, 500)), s = R.sign();
+    const pieces = [420, 860].map((x, i) => ({ t: 'stretch', ...F.pt(x, 360), lmin: 80, lmax, period: r2(R.f(2, 3)), rpm: r2((i ? -s : s) * L(8, 13)), thick: 14, phase: r2(R.f(0, 1)) }));
+    if (d > 0.3) pieces.push({ t: 'warnfloor', x: 560, y: 250, w: 160, h: 220, period: r2(L(3.2, 2.4)), duty: 0.3, warn: 0.6, phase: r2(R.f(0, 1)) });
+    return { cps: [F.pt(640, 70)], pieces };
+  },
+  VORTEX(R, d, F){
+    const L = (a, b) => a + (b - a) * d, len = ri(L(360, 440)), a = R.sign() * L(22, 36);
+    return { cps: [{ x: 640, y: 60 }, { x: 640, y: 660 }], pieces: [
+      { t: 'bar', x: 400, y: 360, len, thick: 14, rpm: r2(a), phase: r2(R.f(0, 1)), blades: 3 }, { t: 'bar', x: 880, y: 360, len, thick: 14, rpm: r2(-a), phase: r2(R.f(0, 1)), blades: 3 },
+      { t: 'orbit', x: 640, y: 360, R: 60, r: 16, rpm: ri(R.sign() * L(60, 80)), phase: 0 },
+      { t: 'wall', x: 380, y: 0, w: 40, h: 150 }, { t: 'wall', x: 860, y: 0, w: 40, h: 150 }, { t: 'wall', x: 380, y: 570, w: 40, h: 150 }, { t: 'wall', x: 860, y: 570, w: 40, h: 150 }] };
+  },
+  // ばらまき: 状態を持たないピースを適当に置き、通れるかはソルバーに任せる
+  CHAOS(R, d, F){
+    const L = (a, b) => a + (b - a) * d, n = ri(L(4, 7)), E = { x: 90, y: 360 }, X = { x: 1190, y: 360 };
+    const TP = [
+      () => ({ t: 'slider', x: -20, y: -200, w: 40, h: 140, dy: 260, period: r2(R.f(1.6, 2.8)), phase: r2(R.f(0, 1)) }), () => ({ t: 'slider', x: -200, y: -20, w: 140, h: 40, dx: 260, period: r2(R.f(1.6, 2.8)), phase: r2(R.f(0, 1)) }),
+      () => ({ t: 'bar', x: 0, y: 0, len: 300, thick: 14, rpm: ri(R.sign() * R.f(18, 30)), phase: r2(R.f(0, 1)) }), () => ({ t: 'bar', x: 0, y: 0, len: 320, thick: 14, rpm: ri(R.sign() * R.f(12, 18)), phase: r2(R.f(0, 1)), blades: 4 }),
+      () => ({ t: 'pulser', x: 0, y: 0, rmin: 16, rmax: 90, period: r2(R.f(1.5, 2.5)), phase: r2(R.f(0, 1)) }), () => ({ t: 'orbit', x: 0, y: 0, R: 100, r: 18, rpm: R.sign() * 40, phase: r2(R.f(0, 1)) }),
+      () => ({ t: 'gate', ax: 0, ay: -110, bx: 0, by: 110, thick: 8, period: 1.4, duty: 0.5, phase: r2(R.f(0, 1)) }), () => ({ t: 'blink', x: -30, y: -120, w: 60, h: 240, period: 1.5, duty: 0.5, phase: r2(R.f(0, 1)) }),
+      () => { const v = R.pick([[1, 0], [-1, 0], [0, 1], [0, -1]]); return { t: 'shooter', x: 0, y: 0, dx: v[0], dy: v[1], speed: 400, interval: 0.9, r: 11, range: 520, phase: r2(R.f(0, 1)) }; },
+      () => ({ t: 'slidelaser', x: 0, y: 0, len: 240, dx: 320, period: r2(R.f(2.2, 3.4)), thick: 8, phase: r2(R.f(0, 1)) }), () => ({ t: 'stretch', x: 0, y: 0, lmin: 80, lmax: 420, period: r2(R.f(2, 3)), rpm: R.sign() * 10, thick: 14, phase: r2(R.f(0, 1)) }),
+      () => ({ t: 'warnfloor', x: -110, y: -90, w: 220, h: 180, period: r2(R.f(2.4, 3.4)), duty: 0.3, warn: 0.6, phase: r2(R.f(0, 1)) }),
+    ];
+    const pieces = [{ t: 'wall', ...F.rect(400, 0, 40, 400) }, { t: 'wall', ...F.rect(840, 320, 40, 400) }];
+    for (let i = 0; i < n; i++){ const rel = R.pick(TP)();
+      for (let a = 0; a < 8; a++){ const p = translate(rel, R.i(13, 51) * 20, R.i(5, 31) * 20); if (placementOk(p, E, X) && padSafe([p], E, SV.PAD_SAFE + 16) && padSafe([p], X, SV.PAD_SAFE + 16)){ pieces.push(p); break; } } }
+    return { cps: [{ x: 640, y: 360 }, F.pt(640, 80)], pieces };
+  },
+};
+const ARCH_MIN_TIER = { VORTEX: 1, CHAOS: 1 }; // EASY には出さない型
+function fallbackRoom(F){ return { name: 'WARM UP', cps: [F.pt(640, 600)], pieces: [{ t: 'wall', ...F.rect(330, 0, 40, 480) }, { t: 'wall', ...F.rect(630, 240, 40, 480) }, { t: 'wall', ...F.rect(930, 0, 40, 480) }] }; }
+// 日付の扱い（JST 固定）
+function dayKeyAt(ms){ return new Date(ms + DAILY.TZ_MIN * 60000).toISOString().slice(0, 10); }
+function dayMs(key){ return Date.parse(key + 'T00:00:00Z'); }
+function dayNum(key){ return Math.round((dayMs(key) - dayMs(DAILY.EPOCH)) / 86400000) + 1; }
+function dayShift(key, n){ return new Date(dayMs(key) + n * 86400000).toISOString().slice(0, 10); }
+function dayDow(key){ return new Date(dayMs(key)).getUTCDay(); }
+// 生成本体。重いので1部屋ごとに yield する（画面を止めないため）。最後に course を return する
+function* dailyGen(date){
+  const tier = DAILY.TIER_BY_DOW[dayDow(date)], base = DAILY.TIER_D[tier], seed = 'cursorrun|' + GEN_VER + '|' + date;
+  const names = RNG(seed).shuffle(Object.keys(ARCH).filter(k => (ARCH_MIN_TIER[k] || 0) <= tier));
+  const start = { x: 90, y: 360 }, rooms = [], bot = []; let t = 0, pos = start, fallbacks = 0, gold = 0;
+  for (let i = 0; i < DAILY.ROOMS; i++){
+    const d = clamp01(base + (i / (DAILY.ROOMS - 1) - 0.5) * 0.3), dir = i % 2 ? -1 : 1, entry = i === 0 ? start : rooms[i - 1].exit, exit = { x: dir > 0 ? 1190 : 90, y: 360 };
+    const limit = DAILY.ROOM_LIMIT[0] + (DAILY.ROOM_LIMIT[1] - DAILY.ROOM_LIMIT[0]) * d;
+    let room = null, sol = null;
+    for (let a = 0; a < 7 && !room; a++){
+      const fb = a === 6, name = names[(i + (a < 3 ? 0 : DAILY.ROOMS)) % names.length], R = RNG(seed + '|' + i + '|' + a), F = frame(dir, R.chance(0.5));
+      const cand = fb ? fallbackRoom(F) : ARCH[name](R, d, F);
+      if (!padSafe(cand.pieces, entry, SV.PAD_SAFE) || !padSafe(cand.pieces, exit, SV.PAD_SAFE)) continue;
+      const rm = { name: cand.name || name, exit, cps: cand.cps.filter(c => padSafe(cand.pieces, c, SV.PAD_SAFE)), pieces: cand.pieces };
+      const s = solveRoom(rm, pos, exit, t, true, limit);
+      // 人はBOTより遅れて着くので、遅い到着時刻でも入口から通れることを確かめる
+      if (!s.ok || !solveRoom(rm, entry, exit, t + 4.37).ok || !solveRoom(rm, entry, exit, t + 11.13).ok) continue;
+      room = rm; sol = s; if (fb) fallbacks++;
+    }
+    if (!room) throw new Error('daily generation failed: ' + date + ' room ' + i);
+    for (const p of sol.path) bot.push(Math.round(p.t * 1000), i, p.x, p.y, 1);
+    rooms.push(room); t += sol.time; pos = sol.path[sol.path.length - 1]; gold += sol.time * (DAILY.MEDAL.A + DAILY.MEDAL.B * d * d * d);
+    yield i + 1;
+  }
+  const par = Math.round(t * 100) / 100, hash = fnv(JSON.stringify({ start, rooms })), g = Math.ceil(gold);
+  return { id: 'daily', key: 'd-' + date + '-' + GEN_VER + '-' + hash, name: 'DAILY #' + dayNum(date), desc: date, daily: { date, num: dayNum(date), tier, hash, fallbacks },
+    medals: [g, Math.ceil(g * DAILY.MEDAL.SILVER), Math.ceil(g * DAILY.MEDAL.BRONZE)], start, rooms, par, bot };
+}
+function buildDaily(date){ const g = dailyGen(date); for (;;){ const r = g.next(); if (r.done) return r.value; } }
+
+// ===================== ゴーストの圧縮 =====================
+// 走行記録 [ms, 部屋, x, y, 生死]×n を 30Hz の等間隔に並べ直し、1サンプル3バイトに詰めて base64 にする。
+// 1サンプル = x 11bit | y 10bit | 生きている 1bit | この瞬間に次の部屋へ進んだ 1bit。60秒の走りで約7KB。
+const GH_MAX = 18000; // 10分ぶん。超えた分は切り捨て（記録タイム自体は有効）
+function encodeGhost(s, totalMs){
+  const n5 = s.length / 5 | 0; if (!n5) return '';
+  const hz = T.GHOST_HZ, N = Math.min(GH_MAX, Math.floor(totalMs * hz / 1000) + 1), u = new Uint8Array(4 + N * 3);
+  u[0] = 1; u[1] = hz; u[2] = N & 255; u[3] = N >> 8;
+  let j = 0, room = 0;
+  for (let i = 0; i < N; i++){
+    const ms = i * 1000 / hz; while (j + 1 < n5 && s[(j + 1) * 5] <= ms) j++;
+    const a = j * 5, b = Math.min(n5 - 1, j + 1) * 5; let x = s[a + 2], y = s[a + 3];
+    if (s[b + 1] === s[a + 1] && s[b] > s[a] && ms > s[a]){ const k = Math.min(1, (ms - s[a]) / (s[b] - s[a])); x += (s[b + 2] - x) * k; y += (s[b + 3] - y) * k; }
+    const adv = s[a + 1] > room ? 1 : 0; if (adv) room++;
+    const v = Math.max(0, Math.min(2047, Math.round(x))) | Math.max(0, Math.min(1023, Math.round(y))) << 11 | (s[a + 4] ? 1 : 0) << 21 | adv << 22;
+    u[4 + i * 3] = v & 255; u[5 + i * 3] = v >> 8 & 255; u[6 + i * 3] = v >> 16 & 255;
+  }
+  let bin = ''; for (let i = 0; i < u.length; i += 8192) bin += String.fromCharCode.apply(null, u.subarray(i, i + 8192));
+  return btoa(bin);
+}
+function decodeGhost(str){
+  try {
+    const bin = atob(str); if (bin.length < 7 || bin.charCodeAt(0) !== 1) return null;
+    const hz = bin.charCodeAt(1), N = bin.charCodeAt(2) | bin.charCodeAt(3) << 8; if (!hz || bin.length !== 4 + N * 3) return null;
+    const s = new Array(N * 5); let room = 0;
+    for (let i = 0; i < N; i++){ const o = 4 + i * 3, v = bin.charCodeAt(o) | bin.charCodeAt(o + 1) << 8 | bin.charCodeAt(o + 2) << 16; if (v >> 22 & 1) room++;
+      s[i * 5] = Math.round(i * 1000 / hz); s[i * 5 + 1] = room; s[i * 5 + 2] = v & 2047; s[i * 5 + 3] = v >> 11 & 1023; s[i * 5 + 4] = v >> 21 & 1; }
+    return s;
+  } catch (e) { return null; }
+}
+
 // ===================== 状態 =====================
 const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
 const H = { time: document.getElementById('hTime'), room: document.getElementById('hRoom'), name: document.getElementById('hName'), line3: document.getElementById('hLine3'),
-  deaths: document.getElementById('hDeaths'), best: document.getElementById('hBest'), dbg: document.getElementById('hDbg'), msg: document.getElementById('msg') };
+  deaths: document.getElementById('hDeaths'), best: document.getElementById('hBest'), dbg: document.getElementById('hDbg'), msg: document.getElementById('msg'),
+  keys: document.getElementById('keys'), toast: document.getElementById('toast') };
 let view = { s: 1, ox: 0, oy: 0 };
-let state = 'menu';           // menu | title | count | race | dead | done | mp
+let state = 'menu';           // menu | board | title | count | race | dead | done | watch | mp
 let cur = { x: -999, y: -999 }, have = false, samples = [], clicks = [], ups = [];
 let history = [], speed = 0; // 自分の軌跡（影用）と速度（区画ルール用）
 let roomIdx = 0, cp = START, cpsHit = new Set();
 let goTime = 0, elapsed = 0, countEnd = 0, deaths = 0, splits = [], finalTime = 0, deathMark = null, flyFlash = 0;
 let trail = [], particles = [], maxSpeed = 0, falseStarts = 0;
-let best = null, ghostOn = true, debug = false, gRec = [], gLastT = -1, gi = 0, gTrail = [];
-function bestKey(c){ return 'cursorrun.best.' + c.id + '.' + COURSE_VER; }
-function loadBest(c){ try { const b = localStorage.getItem(bestKey(c)); return b ? JSON.parse(b) : null; } catch (e) { return null; } }
+let best = null, ghostOn = true, debug = false, gRec = [], gLastT = -1;
+let raceGhosts = [], roomDeaths = [], lastRun = null, doneBest = false, msgVer = -1, toastT = 0;
+
+// ===================== プレイヤーと記録（この端末） =====================
+const LS = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); return true; } catch (e) { return false; } },
+  del(k){ try { localStorage.removeItem(k); } catch (e) {} },
+  keys(){ const out = []; try { for (let i = 0; i < localStorage.length; i++) out.push(localStorage.key(i)); } catch (e) {} return out; },
+};
+function randId(n){ const a = new Uint8Array(n); if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(a); else for (let i = 0; i < n; i++) a[i] = Math.random() * 256; return Array.from(a, b => b.toString(16).padStart(2, '0')).join(''); }
+// pid は公開してよい識別子、token は自分の記録を上書きするための合言葉（server.js がハッシュで照合する）
+const ME = { pid: LS.get('cursorrun.pid'), token: LS.get('cursorrun.token'), name: null };
+if (!ME.pid){ ME.pid = 'p' + randId(8); LS.set('cursorrun.pid', ME.pid); }
+if (!ME.token){ ME.token = randId(16); LS.set('cursorrun.token', ME.token); }
+function setName(n){ ME.name = n; LS.set('cursorrun.name', n); }
+function toast(s){ H.toast.textContent = s; H.toast.hidden = false; toastT = performance.now() + 2000; }
+// 記録 = { t ミリ秒, d 死亡数, ts 達成時刻, g 圧縮ゴースト, rd 部屋ごとの死亡数, sent 送信済みの印 }。コース(キー)ごとに自己ベスト1件
+const RECS = new Map(), REC_GHOST = new Map();
+function boardKey(c){ return c.key || ('c-' + c.id + '-' + COURSE_VER.replace(/\./g, '_')); }
+function loadRec(key){
+  if (RECS.has(key)) return RECS.get(key);
+  let rec = null; try { rec = JSON.parse(LS.get('cursorrun.rec.' + key)); } catch (e) {}
+  if (rec && !(rec.t > 0 && typeof rec.g === 'string')) rec = null;
+  RECS.set(key, rec); return rec;
+}
+function saveRec(key, rec){ RECS.set(key, rec); LS.set('cursorrun.rec.' + key, JSON.stringify(rec)); }
+function recGhost(key, rec){ const c = REC_GHOST.get(key); if (c && c.t === rec.t) return c.s; const s = decodeGhost(rec.g) || []; REC_GHOST.set(key, { t: rec.t, s }); return s; }
+function loadBest(c){ // 自己ベスト。v0.3 までの保存形式があれば引き継ぐ
+  const key = boardKey(c); let rec = loadRec(key);
+  if (!rec && !c.daily){ try { const old = JSON.parse(LS.get('cursorrun.best.' + c.id + '.' + COURSE_VER)); if (old && old.time > 0 && old.s && old.s.length){ rec = { t: Math.round(old.time * 1000), d: old.deaths | 0, ts: 0, g: encodeGhost(old.s, old.time * 1000), sent: '' }; saveRec(key, rec); } } catch (e) {} }
+  return rec ? { time: rec.t / 1000, deaths: rec.d, s: recGhost(key, rec) } : null;
+}
+// デイリーを遊んだ日の記録（連続日数の表示用）
+let DLOG = null;
+function dailyLog(){ if (!DLOG){ try { DLOG = JSON.parse(LS.get('cursorrun.dlog')) || {}; } catch (e) { DLOG = {}; } } return DLOG; }
+function logDaily(date, t, d){ const L = dailyLog(); if (!L[date] || t < L[date].t){ L[date] = { t, d }; LS.set('cursorrun.dlog', JSON.stringify(L)); } }
+function streak(td){ const L = dailyLog(); let n = 0, k = L[td] ? td : dayShift(td, -1); while (L[k]){ n++; k = dayShift(k, -1); } return n; }
+
+// ===================== ランキングの通信 =====================
+// 3段構え: api = server.js が配信しているとき / db = 公開アーティファクトの共有データベース / local = この端末の記録だけ
+const NET = { mode: 'local', offset: 0, canWrite: true, boards: new Map(), ghosts: new Map(), db: null, uid: null, docs: null, ver: 0 };
+const SYNCING = new Set();
+function nowMs(){ return Date.now() + NET.offset; }
+function today(){ return dayKeyAt(nowMs()); }
+function myId(){ return NET.mode === 'db' && NET.uid ? NET.uid : ME.pid; }
+function netInit(){
+  if (typeof window !== 'undefined' && window.claude && typeof window.claude.use === 'function'){
+    Promise.all([window.claude.use('db'), window.claude.use('user')]).then(async ([db, user]) => {
+      if (!db) return;
+      NET.db = db; NET.uid = user ? await user.id() : null; NET.canWrite = !!NET.uid; NET.mode = 'db';
+      // 1人1文書（scores/<自分のid>）。全員ぶんを1回だけ購読し、どのコースの表もここから作る
+      db.collection('scores').limit(1000).onSnapshot(snap => { NET.docs = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) })); NET.ver++; netChanged(); }, () => { if (!NET.docs) NET.docs = []; NET.ver++; });
+      netChanged();
+    }).catch(() => {});
+  } else if (typeof fetch === 'function' && typeof location !== 'undefined' && /^https?:$/.test(location.protocol)){
+    fetch('api/ping').then(r => r.ok ? r.json() : null).then(j => { if (j && j.cursorrun){ NET.mode = 'api'; NET.offset = j.now - Date.now(); NET.ver++; netChanged(); } }).catch(() => {});
+  }
+}
+function netChanged(){ if (state === 'board'){ BOARD.pollAt = 0; syncRec(course); } else if (state === 'done') syncRec(course); }
+function netBoard(key){ // api: 表を取りに行く（結果は NET.boards に入る）
+  if (NET.mode !== 'api') return;
+  const b = NET.boards.get(key) || {}; if (b.loading) return; b.loading = true; NET.boards.set(key, b);
+  fetch('api/board/' + encodeURIComponent(key)).then(r => r.json()).then(j => { b.loading = false; b.rows = Array.isArray(j.rows) ? j.rows : []; if (j.now) NET.offset = j.now - Date.now(); NET.ver++; }).catch(() => { b.loading = false; if (!b.rows) b.rows = []; NET.ver++; });
+}
+function netRows(key){ // いま分かっている全員ぶんの行。まだ取れていなければ null
+  if (NET.mode === 'api'){ const b = NET.boards.get(key); return b && b.rows ? b.rows : null; }
+  if (NET.mode === 'db'){
+    if (!NET.docs) return null; const out = [];
+    for (const d of NET.docs){ const r = d.runs && d.runs[key]; if (r && r.t > 0) out.push({ pid: d.id, name: String(d.name || '?').slice(0, 12), t: +r.t, d: r.d | 0, ts: +r.ts || 0 }); }
+    return out;
+  }
+  return [];
+}
+function netSubmit(key, rec){ // → Promise<送れたか>
+  if (NET.mode === 'api') return fetch('api/board/' + encodeURIComponent(key), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid: ME.pid, token: ME.token, name: myName(), t: rec.t, d: rec.d, g: rec.g }) })
+    .then(r => r.json()).then(j => { if (Array.isArray(j.rows)){ NET.boards.set(key, { rows: j.rows }); NET.ver++; } if (!j.ok && j.err) toast(j.err); return j.ok ? true : 'rejected'; }); // 断られた記録は送り直さない
+  if (NET.mode === 'db' && NET.canWrite) return dbSubmit(key, rec);
+  return Promise.resolve(false);
+}
+async function dbSubmit(key, rec){
+  const ref = NET.db.doc('scores/' + NET.uid), snap = await ref.get(), cur = snap.exists ? snap.data() : {}, runs = { ...(cur.runs || {}) };
+  if (!(runs[key] && runs[key].t <= rec.t)){ await NET.db.doc('scores/' + NET.uid + '/g/' + key).set({ g: rec.g }); runs[key] = { t: rec.t, d: rec.d, ts: rec.ts }; }
+  else if (cur.name === myName()) return true;
+  // 45日より前のデイリーは行とゴーストを消して、1人1文書を小さく保つ
+  const lim = dayShift(today(), -45), old = Object.keys(runs).filter(k => /^d-\d{4}-\d\d-\d\d-/.test(k) && k.slice(2, 12) < lim);
+  for (const k of old) delete runs[k];
+  await ref.set({ name: myName(), runs });
+  for (const k of old) NET.db.doc('scores/' + NET.uid + '/g/' + k).delete().catch(() => {});
+  return true;
+}
+function netGhost(key, pid){ // → Promise<圧縮ゴースト | null>
+  if (NET.mode === 'api') return fetch('api/ghost/' + encodeURIComponent(key) + '/' + encodeURIComponent(pid)).then(r => r.ok ? r.json() : null).then(j => j && j.g || null);
+  if (NET.mode === 'db') return NET.db.doc('scores/' + pid + '/g/' + key).get().then(s => s.exists ? String(s.data().g || '') : null);
+  return Promise.resolve(null);
+}
+function canRank(c){ return !c.daily || c.daily.date === today(); } // 過去のデイリーは練習（順位は当日のまま）
+function syncRec(c){ // 自己ベストがまだ送られていなければ送る。名前を変えたときも送り直す
+  const key = boardKey(c), rec = loadRec(key), tag = NET.mode + '|' + myId() + '|' + myName();
+  if (!rec || rec.sent === tag || NET.mode === 'local' || !NET.canWrite || !canRank(c) || SYNCING.has(key)) return;
+  SYNCING.add(key);
+  const fail = () => { SYNCING.delete(key); if (NET.mode === 'db'){ NET.canWrite = false; NET.ver++; } };
+  netSubmit(key, rec).then(ok => { if (!ok) return fail(); SYNCING.delete(key); const r = loadRec(key); if (r && r.t === rec.t){ r.sent = tag; saveRec(key, r); } NET.ver++; }).catch(fail);
+}
+// 画面に出す行: 共有ぶん＋この端末の自己ベスト（未送信でも出す）＋BOT
+let rowsMemo = { k: '', rows: [] };
+function boardRows(c){
+  const key = boardKey(c), rec = loadRec(key), me = myId(), mk = key + '|' + NET.ver + '|' + NET.mode + '|' + (rec ? rec.t : 0) + '|' + (c.bot ? c.bot.length : 0) + '|' + myName();
+  if (rowsMemo.k === mk) return rowsMemo.rows;
+  const rows = (netRows(key) || []).map(r => ({ ...r, me: r.pid === me }));
+  if (rec){ const i = rows.findIndex(r => r.me); if (i < 0) rows.push({ pid: me, name: myName(), t: rec.t, d: rec.d, me: true, local: true }); else if (rec.t < rows[i].t) rows[i] = { ...rows[i], t: rec.t, d: rec.d, local: true }; }
+  rows.sort((a, b) => a.t - b.t || (a.ts || 0) - (b.ts || 0)); rows.forEach((r, i) => { r.rank = i + 1; });
+  if (c.bot && c.bot.length) rows.push({ pid: 'bot', name: 'BOT', t: Math.round(c.par * 1000), d: 0, bot: true });
+  rowsMemo = { k: mk, rows }; return rows;
+}
+// 行のゴースト（走行データ）。取れていなければ null を返して取りに行く。取れない行は false
+function ghostFor(c, row){
+  if (row.bot) return c.bot || false;
+  const key = boardKey(c);
+  if (row.me){ const rec = loadRec(key); if (rec && rec.t === row.t) return recGhost(key, rec); }
+  const k = key + '|' + row.pid + '|' + row.t, have = NET.ghosts.get(k);
+  if (have !== undefined) return have === 'loading' ? null : have;
+  NET.ghosts.set(k, 'loading');
+  netGhost(key, row.pid).then(g => { NET.ghosts.set(k, (g && decodeGhost(g)) || false); }).catch(() => { NET.ghosts.set(k, false); });
+  return null;
+}
+
+// ===================== デイリーの用意 =====================
+// 生成は1回 50ms 前後。部屋ごとに分けて走らせ、できたものは日付ごとに端末へ保存して次回は読むだけにする
+const DAILIES = new Map(); // 日付 → course | { building, progress }
+function ensureDaily(date){
+  const have = DAILIES.get(date); if (have) return have.building ? null : have;
+  const lk = 'cursorrun.daily.' + GEN_VER + '.' + date; let c = null;
+  try { c = JSON.parse(LS.get(lk)); if (c && c.rooms && c.key) c.bot = decodeGhost(c.bot) || []; else c = null; } catch (e) { c = null; }
+  if (c){ DAILIES.set(date, c); return c; }
+  const st = { building: true, progress: 0 }; DAILIES.set(date, st);
+  const g = dailyGen(date), step = () => {
+    try {
+      const r = g.next(); if (!r.done){ st.progress = r.value; setTimeout(step, 0); return; }
+      const dc = r.value, packed = encodeGhost(dc.bot, dc.par * 1000); dc.bot = decodeGhost(packed) || [];
+      DAILIES.set(date, dc); LS.set(lk, JSON.stringify({ ...dc, bot: packed }));
+      const lim = dayShift(today(), -7); for (const k of LS.keys()) if (k && k.indexOf('cursorrun.daily.') === 0 && k.slice(-10) < lim) LS.del(k);
+      if (BOARD.pending === date && (state === 'menu' || state === 'board')){ BOARD.pending = null; openBoard(dc); }
+    } catch (e) { console.error(e); st.failed = true; }
+  };
+  setTimeout(step, 0); return null;
+}
+// 固定コースのBOT（最初にランキングを開いたときに1度だけ解く）。解けない部屋があれば BOT なし
+function ensureBot(c){
+  if (c.bot !== undefined) return; c.bot = null;
+  const bot = []; let i = 0, t = 0, pos = c.start;
+  const step = () => {
+    const r = solveRoom(c.rooms[i], pos, c.rooms[i].exit, t, true, 40); if (!r.ok) return;
+    for (const p of r.path) bot.push(Math.round(p.t * 1000), i, p.x, p.y, 1);
+    t += r.time; pos = r.path[r.path.length - 1];
+    if (++i < c.rooms.length) setTimeout(step, 0); else { c.par = Math.round(t * 100) / 100; c.bot = decodeGhost(encodeGhost(bot, c.par * 1000)) || []; }
+  };
+  setTimeout(step, 0);
+}
 // 尻尾: カーソルが通った位置にドットを落とし、TRAIL_LIFE 秒で消える
 function dropDot(tr, x, y, now){
   const last = tr[tr.length - 1];
@@ -396,7 +856,9 @@ cvs.addEventListener('pointerdown', e => { const p = toL(e); samples.push(p); cl
 cvs.addEventListener('pointerup', e => { ups.push(toL(e)); });
 cvs.addEventListener('pointerleave', () => { samples.push({ x: -9999, y: -9999, out: true }); });
 window.addEventListener('contextmenu', e => e.preventDefault());
+cvs.addEventListener('wheel', e => { if (state === 'board') BOARD.scroll += Math.sign(e.deltaY); }, { passive: true });
 window.addEventListener('keydown', e => {
+  if (OV.mode){ if (e.key === 'Escape') closeOv(); return; } // 名前入力中はゲームのキーを止める
   const k = e.key.toLowerCase();
   if (state === 'mp'){
     if (k === 'm') mpLeave();
@@ -405,20 +867,46 @@ window.addEventListener('keydown', e => {
     if (k === 'd'){ debug = !debug; H.dbg.hidden = !debug; }
     return;
   }
+  if (k === 'd'){ debug = !debug; H.dbg.hidden = !debug; }
+  if (state === 'menu'){
+    if (k === 'enter' || k === '0') openDaily(today());
+    if (k >= '1' && k <= '3' && COURSES[k - 1]) openBoard(COURSES[k - 1]);
+    if (k === '4') mpEnter();
+    if (k === 'n'){ e.preventDefault(); openName(); }
+    return;
+  }
+  if (state === 'board'){
+    if (k === 'enter' || k === ' '){ e.preventDefault(); play(); }
+    else if (k === 'w') boardAct('watch');
+    else if (k === 'c') doShare();
+    else if (k === 'n'){ e.preventDefault(); openName(); }
+    else if (k === 'arrowleft') boardAct('prev');
+    else if (k === 'arrowright') boardAct('next');
+    else if (k === 'r'){ BOARD.pollAt = 0; toast('ランキングを更新'); }
+    else if (k === 'm' || k === 'escape') toMenu();
+    return;
+  }
+  if (state === 'watch'){ watchKey(k, e); return; }
   if (k === 'r') restart();
   if (k === 'm') toMenu();
+  if (k === 'b' || k === 'escape') openBoard(course);
   if (k === 'g') ghostOn = !ghostOn;
-  if (k === 'd'){ debug = !debug; H.dbg.hidden = !debug; }
-  if (k >= '1' && k <= '3' && COURSES[k - 1]) selectCourse(COURSES[k - 1]);
-  if (k === '4') mpEnter();
+  if (state === 'done'){ if (k === 'w') watchLast(); if (k === 'c') doShare(); }
 });
 
 function toMenu(){ state = 'menu'; trail = []; particles = []; H.line3.hidden = false; setMsg(); }
-function selectCourse(c){ course = c; ROOMS = c.rooms; START = c.start; best = loadBest(c); state = 'title'; restart(); }
+function play(){ state = 'title'; H.line3.hidden = false; restart(); }
 function restart(){
-  if (state === 'menu') return;
-  state = 'title'; roomIdx = 0; cp = START; cpsHit = new Set(); deaths = 0; splits = []; elapsed = 0; deathMark = null;
-  gRec = []; gLastT = -1; gi = 0; gTrail = []; trail = []; particles = []; maxSpeed = 0; falseStarts = 0; history = []; resetPieceState(); setMsg();
+  if (state === 'menu' || state === 'board' || state === 'watch' || state === 'mp') return;
+  state = 'title'; roomIdx = 0; cp = START; cpsHit = new Set(); deaths = 0; splits = []; elapsed = 0; deathMark = null; roomDeaths = ROOMS.map(() => 0);
+  gRec = []; gLastT = -1; trail = []; particles = []; maxSpeed = 0; falseStarts = 0; history = []; resetPieceState(); raceGhosts = buildRaceGhosts(); setMsg();
+}
+// 並走させるゴースト: 自己ベスト＋ランキングで選んだ相手（最大5）
+function buildRaceGhosts(){
+  const out = [], key = boardKey(course), sel = BOARD.sel.get(key) || [];
+  if (best && best.s.length) out.push({ id: 'pb', name: '', color: C.ghost, s: best.s, gi: 0, trail: [] });
+  for (const r of boardRows(course)){ const i = sel.indexOf(r.pid); if (i < 0 || r.me) continue; const s = ghostFor(course, r); if (s && s.length) out.push({ id: r.pid, name: r.name, color: r.bot ? BOT_COLOR : GHOST_COLORS[i % GHOST_COLORS.length], s, gi: 0, trail: [] }); }
+  return out;
 }
 function burst(color){
   for (let i = 0; i < 40; i++){ const a = Math.random() * TAU, v = 120 + Math.random() * 420; particles.push({ x: cur.x, y: cur.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.5 + Math.random() * 0.5, c: i % 3 ? 'haz' : '#fff' }); }
@@ -426,37 +914,83 @@ function burst(color){
   trail = [];
 }
 function die(where){
-  deaths++; state = 'dead'; deathMark = { x: cur.x, y: cur.y, t: elapsed }; burst('#5ee1ff');
+  deaths++; roomDeaths[roomIdx]++; state = 'dead'; deathMark = { x: cur.x, y: cur.y, t: elapsed }; burst('#5ee1ff');
 }
 function enterRoom(i){
-  roomIdx = i; cp = roomEntry(i); cpsHit = new Set(); trail = []; gTrail = []; history = []; resetPieceState();
+  roomIdx = i; cp = roomEntry(i); cpsHit = new Set(); trail = []; history = []; resetPieceState(); for (const g of raceGhosts) g.trail = [];
 }
 function medalFor(c, t){ return t <= c.medals[0] ? 'GOLD' : t <= c.medals[1] ? 'SILVER' : t <= c.medals[2] ? 'BRONZE' : null; }
 function finish(){
   state = 'done'; finalTime = elapsed; splits.push(elapsed);
-  let isBest = false;
-  if (!best || finalTime < best.time){ isBest = true; best = { time: finalTime, deaths, s: gRec }; try { localStorage.setItem(bestKey(course), JSON.stringify(best)); } catch (e) {} }
-  setMsg(isBest);
+  const ms = Math.round(finalTime * 1000), key = boardKey(course), rec = loadRec(key);
+  gRec.push(ms, roomIdx, Math.round(cur.x), Math.round(cur.y), 1); // ゴールの瞬間まで記録する
+  lastRun = { name: myName(), s: gRec.slice(), t: ms, d: deaths };
+  doneBest = !rec || ms < rec.t;
+  if (doneBest){
+    saveRec(key, { t: ms, d: deaths, ts: nowMs(), g: encodeGhost(gRec, ms), rd: roomDeaths.slice(), sent: '' });
+    best = loadBest(course);
+    if (course.daily && canRank(course)) logDaily(course.daily.date, ms, deaths);
+  }
+  syncRec(course); if (NET.mode === 'api') netBoard(key);
+  setMsg(doneBest);
 }
 function fmt(t){ return t.toFixed(2); }
+function esc(s){ return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])); }
 const MEDAL_COLORS = { GOLD: '#ffd044', SILVER: '#cfd8e6', BRONZE: '#d08a4c' };
+const KEYS = {
+  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前',
+  board: 'Enter スタート · W リプレイ · C 結果をコピー · N 名前 · M メニュー',
+  run: 'R リスタート · B ランキング · G ゴースト · M メニュー',
+  watch: 'Space 一時停止 · ←→ 1秒(Shiftで5秒) · ↑↓ 切替 · 1/2/3 速度 · B 戻る',
+};
 function setMsg(isBest){
-  if (state === 'menu') H.msg.innerHTML = '<h1>CURSOR RUN</h1><p>カードをクリックして選択（1 / 2 / 3 / 4 キーでも可）</p>';
-  else if (state === 'title') H.msg.innerHTML = `<h1>${course.name}</h1><p>緑のパッドにカーソルを置くとカウントダウン。壁と赤いものに触れたら直前のパッドへ戻る。部屋の外に出ても死ぬ。</p><p>GOLD ${course.medals[0]}s · SILVER ${course.medals[1]}s · BRONZE ${course.medals[2]}s</p>`;
+  msgVer = NET.ver;
+  H.keys.textContent = state === 'mp' ? '' : KEYS[state] || KEYS.run;
+  if (state === 'menu') H.msg.innerHTML = '<p>カードをクリックして選ぶ</p>';
+  else if (state === 'title') H.msg.innerHTML = `<h1>${esc(course.name)}</h1><p>緑のパッドにカーソルを置くとカウントダウン。壁と赤いものに触れたら直前のパッドへ戻る。部屋の外に出ても死ぬ。</p><p>GOLD ${course.medals[0]}s · SILVER ${course.medals[1]}s · BRONZE ${course.medals[2]}s</p>`;
   else if (state === 'done'){
-    const rows = splits.map((s, i) => `<span>${ROOMS[i].name}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}</span>`).join('');
+    const rows = splits.map((s, i) => `<span>${esc(ROOMS[i].name)}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}</span>`).join('');
     const m = medalFor(course, finalTime);
     const medal = m ? `<div class="medal" style="background:${MEDAL_COLORS[m]};color:#111">${m}</div>` : '';
-    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span></div><p>R でリスタート · M でコース選択</p>`;
+    // 順位は共有ランキングが読めているときだけ出す（自己ベストの順位）
+    const key = boardKey(course), all = boardRows(course).filter(r => !r.bot), me = all.find(r => r.me);
+    const rank = NET.mode !== 'local' && canRank(course) && netRows(key) && me ? `<span>rank</span><span>#${me.rank} / ${all.length}人</span>` : '';
+    const note = course.daily && !canRank(course) ? '<p>過去のデイリーは練習扱い（ランキングには載りません）</p>' : '';
+    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span>${rank}</div>${note}<p>R リスタート · W 今の走りを見る · C 結果をコピー · B ランキング</p>`;
   } else H.msg.innerHTML = '';
 }
-setMsg();
 
-// メニューのカード配置（コース3枚＋ONLINE）
+// メニューのカード配置（上にデイリー、下にコース3枚＋ONLINE）
 function menuCards(){
   const items = [...COURSES.map(c => ({ kind: 'course', c })), { kind: 'online' }];
-  const w = 290, h = 230, gap = 30, n = items.length, x0 = (T.W - (n * w + (n - 1) * gap)) / 2, y = 250;
-  return items.map((it, i) => ({ ...it, x: x0 + i * (w + gap), y, w, h }));
+  const w = 290, h = 230, gap = 30, n = items.length, x0 = (T.W - (n * w + (n - 1) * gap)) / 2, y = 330;
+  return [{ kind: 'daily', x: x0, y: 124, w: n * w + (n - 1) * gap, h: 180 }, ...items.map((it, i) => ({ ...it, x: x0 + i * (w + gap), y, w, h }))];
+}
+
+// ===================== 名前入力・共有テキスト =====================
+const OV = { el: document.getElementById('overlay'), form: document.getElementById('ovForm'), label: document.getElementById('ovLabel'), name: document.getElementById('ovName'), text: document.getElementById('ovText'), ok: document.getElementById('ovOk'), cancel: document.getElementById('ovCancel'), mode: null };
+function openName(){ OV.mode = 'name'; OV.label.textContent = 'ランキングに出す名前（12文字まで）'; OV.name.hidden = false; OV.text.hidden = true; OV.ok.hidden = false; OV.name.value = myName(); OV.el.hidden = false; OV.name.focus(); OV.name.select(); }
+function openShare(txt){ OV.mode = 'share'; OV.label.textContent = '自動でコピーできませんでした。下の文を選んでコピーしてください'; OV.name.hidden = true; OV.text.hidden = false; OV.ok.hidden = true; OV.text.value = txt; OV.el.hidden = false; OV.text.focus(); OV.text.select(); }
+function closeOv(){ OV.el.hidden = true; OV.mode = null; }
+OV.form.addEventListener('submit', e => {
+  e.preventDefault();
+  if (OV.mode === 'name'){ const n = OV.name.value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 12); if (n && n !== myName()){ setName(n); toast('名前を「' + n + '」にしました'); if (state === 'board' || state === 'done') syncRec(course); } }
+  closeOv();
+});
+OV.cancel.addEventListener('click', closeOv);
+// 結果の共有文。部屋ごとの死亡数を色の列にする（0回 緑 / 1回 黄 / 2回以上 赤）
+function shareText(c, rec){
+  const m = medalFor(c, rec.t / 1000), key = boardKey(c), all = boardRows(c).filter(r => !r.bot), me = all.find(r => r.me);
+  const lines = [c.daily ? `Cursor Run DAILY #${c.daily.num} (${c.daily.date})` : `Cursor Run ${c.name}`];
+  lines.push(`${fmt(rec.t / 1000)}s · deaths ${rec.d}` + (m ? ' · ' + m : '') + (NET.mode !== 'local' && netRows(key) && me && canRank(c) ? ` · #${me.rank}/${all.length}` : ''));
+  if (rec.rd && rec.rd.length) lines.push(rec.rd.map(n => n === 0 ? '🟩' : n === 1 ? '🟨' : '🟥').join(''));
+  if (typeof location !== 'undefined' && /^https?:$/.test(location.protocol) && !(typeof window !== 'undefined' && window.claude)) lines.push(location.origin + location.pathname);
+  return lines.join('\n');
+}
+function doShare(){
+  const rec = loadRec(boardKey(course)); if (!rec){ toast('まだ記録がありません'); return; }
+  const txt = shareText(course, rec), fail = () => openShare(txt);
+  try { if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(() => toast('結果をコピーしました'), fail); else fail(); } catch (e) { fail(); }
 }
 
 // ===================== 更新（シングル） =====================
@@ -466,9 +1000,18 @@ function hazardTime(now){
   if (state === 'count') return 0;
   return now / 1000; // タイトル中はプレビューで動かす
 }
+// メニュー・ランキング・リプレイ共通: カーソルを動かして尻尾を落とすだけ
+function uiCursor(now){
+  for (const s of samples){ if (s.out){ have = false; continue; } have = true; cur = s; dropDot(trail, cur.x, cur.y, now); }
+  samples.length = 0; pruneTrail(trail, now);
+}
 function update(now){
   const dt = Math.min(0.05, (now - lastNow) / 1000); lastNow = now;
+  if (toastT && now > toastT){ toastT = 0; H.toast.hidden = true; }
   if (state === 'mp'){ mpUpdate(now, dt); return; }
+  if (state === 'board'){ boardUpdate(now, dt); return; }
+  if (state === 'watch'){ watchUpdate(now, dt); return; }
+  if (state === 'done' && msgVer !== NET.ver) setMsg(doneBest); // 順位が届いたら結果表示を更新
   if (state === 'race' || state === 'dead') elapsed = (now - goTime) / 1000;
   const room = ROOMS[roomIdx], ht = hazardTime(now);
   const prevCur = { x: cur.x, y: cur.y }, hadCur = have;
@@ -491,15 +1034,20 @@ function update(now){
   }
   samples.length = 0;
   if (state === 'menu'){
-    for (const c of clicks){ for (const card of menuCards()) if (inRect(c, card)){ if (card.kind === 'course') selectCourse(card.c); else mpEnter(); } }
+    const td = today(), dc = ensureDaily(td); // 日付が変わったらその場で次のデイリーを用意する
+    if (dc && NET.mode === 'api' && now > BOARD.menuPollAt){ BOARD.menuPollAt = now + 30000; netBoard(boardKey(dc)); }
+    for (const c of clicks){
+      if (inRect(c, menuNameChip())){ openName(); break; }
+      for (const card of menuCards()) if (state === 'menu' && inRect(c, card)){ if (card.kind === 'course') openBoard(card.c); else if (card.kind === 'daily') openDaily(td); else mpEnter(); }
+    }
   }
   clicks.length = 0; ups.length = 0;
-  if (state === 'mp'){ draw(now, null, [], 0); return; }
+  if (state === 'mp' || state === 'board'){ draw(now, null, [], 0); return; }
   speed = dt > 0 && hadCur && have ? dist(prevCur, cur) / dt : 0; if (state === 'race') maxSpeed = Math.max(maxSpeed, speed);
   env.cur = cur; env.have = have; env.speed = speed;
   if (state === 'race' && have){ history.push({ x: cur.x, y: cur.y, t: elapsed }); while (history.length && history[0].t < elapsed - 10) history.shift(); }
 
-  if (state === 'count' && now >= countEnd){ state = 'race'; goTime = now; elapsed = 0; gRec = []; gLastT = -1; gi = 0; gTrail = []; history = []; resetPieceState(); }
+  if (state === 'count' && now >= countEnd){ state = 'race'; goTime = now; elapsed = 0; gRec = []; gLastT = -1; history = []; resetPieceState(); for (const g of raceGhosts){ g.gi = 0; g.trail = []; } }
   if (state === 'race' && have){
     // 静止中に突っ込んでくる障害物、区画ルール
     const h = sweepHit(ps, cur.x, cur.y, cur.x, cur.y) || ruleHit(room.pieces, env); if (h) die(h);
@@ -513,7 +1061,7 @@ function update(now){
   // ゴースト記録
   if ((state === 'race' || state === 'dead') && elapsed - gLastT >= 1 / T.GHOST_HZ){ gLastT = elapsed; gRec.push(Math.round(elapsed * 1000), roomIdx, Math.round(cur.x), Math.round(cur.y), state === 'race' ? 1 : 0); }
 
-  pruneTrail(trail, now); pruneTrail(gTrail, now);
+  pruneTrail(trail, now); for (const g of raceGhosts) pruneTrail(g.trail, now);
   stepParticles(dt);
   flyFlash = Math.max(0, flyFlash - dt * 2);
 
@@ -536,10 +1084,11 @@ const MP = { ws: null, id: null, offset: 0, snap: null, me: null, others: {}, st
 const MP_START = { x: 90, y: 360 }, MP_GOAL = { x: 1190, y: 360 };
 const PHASE_LABEL = { lobby: 'LOBBY', box: 'ピースを選べ', place: '設置せよ', count: 'スタートパッドに乗れ', run: 'GO', results: 'RESULT', final: 'WINNER' };
 function myName(){
-  const u = new URLSearchParams(location.search).get('name'); if (u) return u.slice(0, 12);
-  let n = null; try { n = localStorage.getItem('cursorrun.name'); } catch (e) {}
-  if (!n){ const L = ['ひよこ', 'うま', 'ねこ', 'いぬ', 'かえる', 'さる', 'きつね', 'くま']; n = L[Math.floor(Math.random() * L.length)] + Math.floor(10 + Math.random() * 90); try { localStorage.setItem('cursorrun.name', n); } catch (e) {} }
-  return n;
+  if (ME.name) return ME.name;
+  const u = new URLSearchParams(location.search).get('name'); if (u) return ME.name = u.slice(0, 12);
+  let n = LS.get('cursorrun.name');
+  if (!n){ const L = ['ひよこ', 'うま', 'ねこ', 'いぬ', 'かえる', 'さる', 'きつね', 'くま']; n = L[Math.floor(Math.random() * L.length)] + Math.floor(10 + Math.random() * 90); LS.set('cursorrun.name', n); }
+  return ME.name = n;
 }
 function mpNote(s, ms){ MP.note = s; MP.noteT = ms === Infinity ? Infinity : performance.now() + (ms || 2000); }
 function mpSend(o){ if (MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify(o)); }
@@ -676,32 +1225,64 @@ function head(x, y, color, alpha, hollow){
   else { ctx.fillStyle = color; ctx.fill(); ctx.shadowBlur = 0; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill(); }
   ctx.restore();
 }
-function ghostPose(){
-  if (!best || !ghostOn || !(state === 'race' || state === 'dead')) return null;
-  const s = best.s, n = s.length / 5, ms = elapsed * 1000;
-  while (gi + 1 < n && s[(gi + 1) * 5] <= ms) gi++;
-  if (gi >= n) return null;
-  const a = gi * 5, b = Math.min(n - 1, gi + 1) * 5;
+// 走行中のゴースト位置（時刻は前にしか進まないので添字を覚えておく）
+function ghostPose(g){
+  if (!ghostOn || !(state === 'race' || state === 'dead')) return null;
+  const s = g.s, n = s.length / 5, ms = elapsed * 1000;
+  while (g.gi + 1 < n && s[(g.gi + 1) * 5] <= ms) g.gi++;
+  if (g.gi >= n) return null;
+  const a = g.gi * 5, b = Math.min(n - 1, g.gi + 1) * 5;
   if (s[a + 1] !== roomIdx) return { room: s[a + 1] };
   let x = s[a + 2], y = s[a + 3];
   if (s[b + 1] === roomIdx && s[b] > s[a]){ const u = Math.min(1, (ms - s[a]) / (s[b] - s[a])); x += (s[b + 2] - x) * u; y += (s[b + 3] - y) * u; }
   return { room: roomIdx, x, y, alive: s[a + 4] === 1 };
 }
+// リプレイ用: 任意の時刻の位置（二分探索なのでシークできる）
+function poseAt(s, ms){
+  const n = s.length / 5; if (!n) return null;
+  let lo = 0, hi = n - 1; while (lo < hi){ const mid = (lo + hi + 1) >> 1; if (s[mid * 5] <= ms) lo = mid; else hi = mid - 1; }
+  const a = lo * 5, b = Math.min(n - 1, lo + 1) * 5; let x = s[a + 2], y = s[a + 3];
+  if (s[b + 1] === s[a + 1] && s[b] > s[a] && ms > s[a]){ const u = Math.min(1, (ms - s[a]) / (s[b] - s[a])); x += (s[b + 2] - x) * u; y += (s[b + 3] - y) * u; }
+  return { room: s[a + 1], x, y, alive: s[a + 4] === 1 };
+}
 function text(str, x, y, size, color, align, weight){
   ctx.fillStyle = color; ctx.font = `${weight || 700} ${size}px ${css('--font')}`; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle'; ctx.fillText(str, x, y);
 }
+const DOW = '日月火水木金土';
+function hms(ms){ const s = Math.max(0, Math.floor(ms / 1000)), p = v => String(v).padStart(2, '0'); return p(Math.floor(s / 3600)) + ':' + p(Math.floor(s / 60) % 60) + ':' + p(s % 60); }
+function menuNameChip(){ return { x: T.W - 15 - 250, y: 46, w: 250, h: 40 }; }
+function chip(r, label, hover){ ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : C['wall-edge']; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 8); ctx.fill(); ctx.stroke(); text(label, r.x + r.w / 2, r.y + r.h / 2 + 1, 15, C.fg, 'center', 500); }
 function drawMenu(now){
-  text('CURSOR RUN', T.W / 2, 130, 56, C.fg, 'center');
+  text('CURSOR RUN', 15, 68, 46, C.fg);
+  const nc = menuNameChip(); chip(nc, '名前  ' + myName() + '  ✎', have && inRect(cur, nc));
   for (const card of menuCards()){
     const hover = have && inRect(cur, card);
-    ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2;
+    ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : card.kind === 'daily' ? C.exit : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2;
     ctx.beginPath(); ctx.roundRect(card.x, card.y, card.w, card.h, 10); ctx.fill(); ctx.stroke();
-    if (card.kind === 'course'){
-      const c = card.c, b = loadBest(c), m = b ? medalFor(c, b.time) : null;
+    if (card.kind === 'daily'){
+      const td = today(), c = ensureDaily(td), x = card.x + 28, y = card.y;
+      text('DAILY #' + dayNum(td), x, y + 46, 40, C.exit);
+      if (!c){ const st = DAILIES.get(td) || {}; text(st.failed ? '今日のコースを作れませんでした' : '今日のコースを生成中… ' + (st.progress || 0) + ' / ' + DAILY.ROOMS, x, y + 96, 16, C.dim, 'left', 500); continue; }
+      const key = boardKey(c), rec = loadRec(key), m = rec ? medalFor(c, rec.t / 1000) : null, all = boardRows(c).filter(r => !r.bot), me = all.find(r => r.me), shared = NET.mode !== 'local' && netRows(key), st = streak(td);
+      text(`${td} (${DOW[dayDow(td)]}) · ${DAILY.TIER_NAME[c.daily.tier]} · ${c.rooms.length} ROOMS`, x, y + 92, 16, C.fg, 'left', 500);
+      text(c.rooms.map(r => r.name).join(' › '), x, y + 122, 14, C.dim, 'left', 500);
+      text('全員が同じコース。毎日 0:00 (JST) に切り替わる', x, y + 150, 13, C.dim, 'left', 500);
+      const mx = card.x + 640;
+      text('YOUR BEST', mx, y + 36, 13, C.dim);
+      text(rec ? fmt(rec.t / 1000) : '--', mx, y + 76, 38, m ? MEDAL_COLORS[m] : rec ? C.fg : C.dim);
+      text(rec ? (shared && me ? `#${me.rank} / ${all.length}人` : `deaths ${rec.d}`) + (m ? ' · ' + m : '') : 'まだ走っていません', mx, y + 116, 15, C.dim, 'left', 500);
+      text(st > 0 ? `${st}日連続` : '今日が1日目', mx, y + 148, 15, st > 1 ? C.exit : C.dim, 'left', 500);
+      const rx = card.x + card.w - 28, top = all[0];
+      text('次のデイリーまで', rx, y + 36, 13, C.dim, 'right');
+      text(hms(dayMs(dayShift(td, 1)) - DAILY.TZ_MIN * 60000 - nowMs()), rx, y + 76, 38, C.fg, 'right');
+      text(shared ? (top ? `1位 ${top.name}  ${fmt(top.t / 1000)}` : 'まだ誰も走っていません') : NET.mode === 'local' ? 'ランキングはこの端末だけ' : '', rx, y + 116, 15, C.dim, 'right', 500);
+      text('クリック / Enter', rx, y + 148, 13, C.dim, 'right', 500);
+    } else if (card.kind === 'course'){
+      const c = card.c, b = loadRec(boardKey(c)), m = b ? medalFor(c, b.t / 1000) : null;
       text(c.name, card.x + 24, card.y + 44, 32, C.fg);
       text(c.desc, card.x + 24, card.y + 84, 15, C.dim, 'left', 500);
       text(`${c.rooms.length} ROOMS`, card.x + 24, card.y + 120, 14, C.dim, 'left', 500);
-      text('BEST ' + (b ? fmt(b.time) : '--'), card.x + 24, card.y + 160, 18, m ? MEDAL_COLORS[m] : C.fg);
+      text('BEST ' + (b ? fmt(b.t / 1000) : '--'), card.x + 24, card.y + 160, 18, m ? MEDAL_COLORS[m] : C.fg);
       text(`${c.medals[0]} / ${c.medals[1]} / ${c.medals[2]} s`, card.x + 24, card.y + 194, 13, C.dim, 'left', 500);
     } else {
       text('ONLINE', card.x + 24, card.y + 44, 32, C.start);
@@ -781,11 +1362,14 @@ function drawSingle(now, room, ps, ht){
     ctx.beginPath(); ctx.arc(cp.x, cp.y, T.PAD_R + 6 + pulse * 10, 0, TAU); ctx.strokeStyle = C.cp; ctx.lineWidth = 2; ctx.globalAlpha = 0.6 + 0.4 * pulse; ctx.stroke(); ctx.globalAlpha = 1;
   }
   drawPieces(room.pieces, ps, ht);
-  const g = ghostPose();
-  if (g && g.room === roomIdx){
-    if (g.alive) dropDot(gTrail, g.x, g.y, now);
-    drawTrail(gTrail, C.ghost, 0.5, now); head(g.x, g.y, C.ghost, 0.6, !g.alive);
-  } else gTrail = [];
+  for (const gh of raceGhosts){
+    const g = ghostPose(gh);
+    if (g && g.room === roomIdx){
+      if (g.alive) dropDot(gh.trail, g.x, g.y, now);
+      drawTrail(gh.trail, gh.color, 0.5, now); head(g.x, g.y, gh.color, 0.6, !g.alive);
+      if (gh.name) text(gh.name, g.x, g.y - 18, 12, gh.color, 'center', 500);
+    } else gh.trail = [];
+  }
   if (deathMark && state === 'dead'){ ctx.beginPath(); ctx.moveTo(deathMark.x - 9, deathMark.y - 9); ctx.lineTo(deathMark.x + 9, deathMark.y + 9); ctx.moveTo(deathMark.x + 9, deathMark.y - 9); ctx.lineTo(deathMark.x - 9, deathMark.y + 9); ctx.strokeStyle = C.haz; ctx.lineWidth = 3; ctx.stroke(); }
   drawParticles();
   drawTrail(trail, C.player, 0.9, now);
@@ -884,6 +1468,228 @@ function drawMulti(now, ps, ht, level){
   if (MP.note && performance.now() < MP.noteT){ panel(T.W / 2 - 360, T.H - 90, 720, 44); text(MP.note, T.W / 2, T.H - 68, 15, C.fg, 'center', 500); }
 }
 
+// ===================== ランキング画面 =====================
+// コースを選ぶとまずここに来る。左に自分の記録と操作、右に順位表、下に部屋の一覧（動く縮小図）。
+const GHOST_COLORS = ['#ffb14a', '#b980ff', '#49e07c', '#ff7ab8', '#7cf5d6'], BOT_COLOR = '#a9b6d1';
+const BOARD = { sel: new Map(), scroll: 0, pollAt: 0, menuPollAt: 0, pending: null }; // sel: コース(キー) → 並走相手の pid の並び
+const BL = { x: 500, y: 150, w: 740, rh: 34, max: 11 }; // 順位表の位置と行数
+function openBoard(c){
+  course = c; ROOMS = c.rooms; START = c.start; best = loadBest(c); state = 'board'; BOARD.scroll = 0; BOARD.pollAt = 0; BOARD.pending = null; trail = []; particles = []; H.line3.hidden = true;
+  ensureBot(c); syncRec(c); setMsg();
+}
+function openDaily(date){ const c = ensureDaily(date); if (c) openBoard(c); else { BOARD.pending = date; toast('コースを生成中…'); } }
+function boardNameChip(){ return { x: T.W - 40 - 250, y: 36, w: 250, h: 40 }; }
+function boardButtons(){
+  const b = [{ id: 'play', x: 40, y: 452, w: 190, h: 56, label: 'PLAY', go: true }, { id: 'watch', x: 240, y: 452, w: 110, h: 56, label: 'WATCH' }, { id: 'share', x: 360, y: 452, w: 110, h: 56, label: 'SHARE' }];
+  if (course.daily){ const td = today(), d = course.daily.date; b.push({ id: 'prev', x: 40, y: 520, w: 136, h: 36, label: '◀ 前の日', off: dayNum(d) <= 1 }, { id: 'today', x: 187, y: 520, w: 136, h: 36, label: '今日', off: d === td }, { id: 'next', x: 334, y: 520, w: 136, h: 36, label: '次の日 ▶', off: d >= td }); }
+  return b;
+}
+function boardAct(id){
+  const b = boardButtons().find(q => q.id === id); if (!b || b.off) return;
+  if (id === 'play') play();
+  else if (id === 'share') doShare();
+  else if (id === 'watch') startWatch(watchList(course), 0);
+  else if (id === 'prev') openDaily(dayShift(course.daily.date, -1));
+  else if (id === 'next') openDaily(dayShift(course.daily.date, 1));
+  else if (id === 'today') openDaily(today());
+}
+function rowColor(c, r){ if (r.me) return C.player; const i = (BOARD.sel.get(boardKey(c)) || []).indexOf(r.pid); return i < 0 ? null : r.bot ? BOT_COLOR : GHOST_COLORS[i % GHOST_COLORS.length]; }
+function toggleSel(c, r){
+  if (r.me){ toast('自分のベストはいつも並走します（走行中 G で全ゴーストを切替）'); return; }
+  const key = boardKey(c), sel = (BOARD.sel.get(key) || []).slice(), i = sel.indexOf(r.pid);
+  if (i >= 0) sel.splice(i, 1); else if (sel.length >= 5){ toast('ゴーストは5つまで'); return; } else { sel.push(r.pid); ghostFor(c, r); }
+  BOARD.sel.set(key, sel);
+}
+// 初回は自力で走ってもらう。自己ベストができたら「ひとつ上」と「1位」を相手に選んでおく（手で選び直したらそちらを優先）
+function autoSelect(c){
+  const key = boardKey(c); if (BOARD.sel.has(key) || netRows(key) === null) return;
+  const rows = boardRows(c).filter(r => !r.bot), mi = rows.findIndex(r => r.me); if (mi < 0 || rows.length < 2) return;
+  BOARD.sel.set(key, mi === 0 ? [rows[1].pid] : mi === 1 ? [rows[0].pid] : [rows[mi - 1].pid, rows[0].pid]);
+}
+// リプレイに出す走り: 選んだ相手＋自分。何も選んでいなければ先頭の行（1位。誰もいなければBOT）
+function watchList(c){
+  const rows = boardRows(c), sel = BOARD.sel.get(boardKey(c)) || []; let pick = rows.filter(r => sel.includes(r.pid));
+  if (pick.length){ const me = rows.find(r => r.me); if (me) pick.push(me); } else pick = rows.slice(0, 1);
+  const out = []; let loading = false;
+  for (const r of pick){ const s = ghostFor(c, r); if (s === null) loading = true; else if (s && s.length) out.push({ name: r.name, color: rowColor(c, r) || (r.bot ? BOT_COLOR : GHOST_COLORS[0]), s, t: r.t, d: r.d }); }
+  if (loading){ toast('ゴーストを読み込み中… もう一度押してください'); return null; }
+  return out;
+}
+function boardUpdate(now, dt){
+  uiCursor(now);
+  const c = course, key = boardKey(c), rows = boardRows(c);
+  if (NET.mode === 'api' && now > BOARD.pollAt){ BOARD.pollAt = now + 20000; netBoard(key); syncRec(c); }
+  autoSelect(c);
+  const sel = BOARD.sel.get(key) || []; for (const r of rows) if (sel.includes(r.pid)) ghostFor(c, r); // 選んだ相手は先に読んでおく
+  BOARD.scroll = Math.max(0, Math.min(rows.length - BL.max, BOARD.scroll));
+  for (const p of clicks){
+    if (inRect(p, boardNameChip())){ openName(); break; }
+    const b = boardButtons().find(q => !q.off && inRect(p, q)); if (b){ boardAct(b.id); break; }
+    const i = Math.floor((p.y - BL.y) / BL.rh) + BOARD.scroll;
+    if (p.x >= BL.x && p.x <= BL.x + BL.w && p.y >= BL.y && i < Math.min(rows.length, BOARD.scroll + BL.max)) toggleSel(c, rows[i]);
+  }
+  clicks.length = 0; ups.length = 0;
+  if (state !== 'board') return; // PLAY などで画面が変わった
+  stepParticles(dt);
+  H.time.textContent = ''; H.room.textContent = ''; H.name.textContent = '';
+  draw(now, null, [], 0);
+}
+function btn(b){
+  const hover = have && !b.off && inRect(cur, b);
+  ctx.globalAlpha = b.off ? 0.35 : 1; ctx.fillStyle = b.go && hover ? C.start : hover ? C['card-hi'] : C.card; ctx.strokeStyle = b.go ? C.start : hover ? C.player : C['wall-edge']; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 8); ctx.fill(); ctx.stroke();
+  text(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1, b.h > 40 ? 20 : 14, b.go ? (hover ? '#111' : C.start) : C.fg, 'center'); ctx.globalAlpha = 1;
+}
+function drawBoard(now){
+  const c = course, key = boardKey(c), rows = boardRows(c), rec = loadRec(key), shared = NET.mode !== 'local' && netRows(key), all = rows.filter(r => !r.bot), me = all.find(r => r.me);
+  text(c.name, 40, 62, 44, c.daily ? C.exit : C.fg);
+  text(c.daily ? `${c.daily.date} (${DOW[dayDow(c.daily.date)]}) · ${DAILY.TIER_NAME[c.daily.tier]} · ${c.rooms.length} ROOMS` : `${c.desc} · ${c.rooms.length} ROOMS`, 42, 104, 16, C.dim, 'left', 500);
+  const nc = boardNameChip(); chip(nc, '名前  ' + myName() + '  ✎', have && inRect(cur, nc));
+  // 左: 自分の記録
+  panel(40, 130, 430, 306);
+  text('YOUR BEST', 62, 158, 13, C.dim);
+  if (rec){
+    const m = medalFor(c, rec.t / 1000);
+    text(fmt(rec.t / 1000), 62, 204, 50, m ? MEDAL_COLORS[m] : C.fg);
+    text(`deaths ${rec.d}` + (m ? ' · ' + m : ''), 64, 246, 15, C.dim, 'left', 500);
+    if (shared && me){ text('#' + me.rank, 448, 202, 44, C.fg, 'right'); text(`/ ${all.length}人`, 448, 246, 15, C.dim, 'right', 500); }
+  } else { text('--', 62, 204, 50, C.dim); text('まだ走っていません', 64, 246, 15, C.dim, 'left', 500); }
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(62, 272); ctx.lineTo(448, 272); ctx.stroke();
+  let y = 300; const line = (a, b, col) => { text(a, 62, y, 13, C.dim); text(b, 448, y, 15, col || C.fg, 'right', 500); y += 31; };
+  line('MEDALS', `GOLD ${c.medals[0]}s · SILVER ${c.medals[1]}s · BRONZE ${c.medals[2]}s`);
+  line('BOT', c.bot && c.bot.length ? fmt(c.par) + 's（ほぼ最短の走り）' : '--');
+  if (c.daily){
+    const td = today();
+    if (c.daily.date === td){ const st = streak(td); line('STREAK', st > 0 ? st + '日連続' : '今日が1日目', st > 1 ? C.exit : C.fg); line('次のデイリーまで', hms(dayMs(dayShift(td, 1)) - DAILY.TZ_MIN * 60000 - nowMs())); }
+    else line('過去のデイリー', '練習（順位は当日のまま）', C.exit);
+  }
+  for (const b of boardButtons()) btn(b);
+  // 右: 順位表
+  const x = BL.x, w = BL.w;
+  text('RANKING', x, 104, 20, C.fg);
+  text(NET.mode === 'api' ? 'ONLINE · サーバーで共有中' : NET.mode === 'db' ? (NET.canWrite ? 'ONLINE · 共有ランキング' : 'ONLINE · 閲覧のみ（自分の記録はこの端末に保存）') : 'この端末の記録だけ表示中', x + 110, 105, 13, NET.mode === 'local' ? C.dim : C.start, 'left', 500);
+  panel(x, 120, w, 414);
+  text('#', x + 30, 136, 12, C.dim, 'center'); text('NAME', x + 88, 136, 12, C.dim); text('TIME', x + w - 230, 136, 12, C.dim, 'right'); text('GAP', x + w - 120, 136, 12, C.dim, 'right'); text('DEATHS', x + w - 24, 136, 12, C.dim, 'right');
+  const lead = all.length ? all[0].t : 0, end = Math.min(rows.length, BOARD.scroll + BL.max);
+  for (let i = BOARD.scroll; i < end; i++){
+    const r = rows[i], ry = BL.y + (i - BOARD.scroll) * BL.rh, cy = ry + BL.rh / 2, hover = have && cur.x >= x && cur.x <= x + w && cur.y >= ry && cur.y < ry + BL.rh, col = rowColor(c, r), g = col && !r.me ? ghostFor(c, r) : undefined;
+    if (r.me){ ctx.fillStyle = 'rgba(94,225,255,0.10)'; ctx.fillRect(x + 2, ry, w - 4, BL.rh); }
+    if (hover){ ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(x + 2, ry, w - 4, BL.rh); }
+    text(r.bot ? '–' : r.rank + '', x + 30, cy, 16, r.rank <= 3 ? C.exit : C.fg, 'center');
+    ctx.beginPath(); ctx.arc(x + 62, cy, 7, 0, TAU); // 並走の印: 選択中は塗り、未選択は輪
+    if (col){ ctx.fillStyle = col; ctx.globalAlpha = g === null ? 0.5 + 0.4 * Math.sin(now / 120) : 1; ctx.fill(); ctx.globalAlpha = 1; } else { ctx.strokeStyle = C.dim; ctx.lineWidth = 1.5; ctx.stroke(); }
+    text(r.name + (r.me ? '  (you)' : ''), x + 88, cy, 16, r.bot ? BOT_COLOR : C.fg, 'left', 500);
+    const note = r.local && NET.mode !== 'local' && canRank(c) ? '未送信' : g === false ? 'ゴーストなし' : ''; if (note) text(note, x + 400, cy, 12, C.dim, 'right', 500);
+    text(fmt(r.t / 1000), x + w - 230, cy, 18, C.fg, 'right');
+    text(r.bot || !lead || r.t === lead ? '' : '+' + fmt((r.t - lead) / 1000), x + w - 120, cy, 14, C.dim, 'right', 500);
+    text(r.bot ? '' : r.d + '', x + w - 24, cy, 14, C.dim, 'right', 500);
+  }
+  if (!rows.length) text(NET.mode !== 'local' && shared === null ? 'ランキングを読み込み中…' : 'まだ記録がありません。最初の記録を作ろう', x + w / 2, 330, 16, C.dim, 'center', 500);
+  text('行をクリックして並走するゴーストを選ぶ（5つまで）', x, 552, 13, C.dim, 'left', 500);
+  if (rows.length > BL.max) text(`${BOARD.scroll + 1}–${end} / ${rows.length}（ホイールで送る）`, x + w, 552, 12, C.dim, 'right', 500);
+  // 下: 部屋の縮小図（今の時刻で動く）
+  const n = c.rooms.length, gap = 10, tw = (1200 - (n - 1) * gap) / n, sc = tw / T.W, th = T.H * sc, ty = 708 - th, t = now / 1000;
+  c.rooms.forEach((room, i) => {
+    const tx = 40 + i * (tw + gap), entry = i === 0 ? c.start : c.rooms[i - 1].exit;
+    ctx.save(); ctx.beginPath(); ctx.rect(tx, ty, tw, th); ctx.clip(); ctx.fillStyle = C.arena; ctx.fillRect(tx, ty, tw, th); ctx.translate(tx, ty); ctx.scale(sc, sc);
+    pad(entry.x, entry.y, T.PAD_R, i ? C.cp : C.start, '', true); for (const q of room.cps) pad(q.x, q.y, T.PAD_R, C.cp, '', false);
+    if (i === n - 1) goal(room.exit.x, room.exit.y, T.PAD_R); else pad(room.exit.x, room.exit.y, T.PAD_R, C.exit, '', true);
+    drawPieces(room.pieces, prims(room, t), t); ctx.restore();
+    ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 1; ctx.strokeRect(tx + 0.5, ty + 0.5, tw - 1, th - 1);
+    ctx.fillStyle = 'rgba(7,9,15,0.78)'; ctx.fillRect(tx + 1, ty + 1, 22 + room.name.length * 8.5, 20); text((i + 1) + ' ' + room.name, tx + 7, ty + 11, 12, C.fg, 'left', 500);
+  });
+}
+
+// ===================== リプレイ =====================
+// 記録された走りを時刻どおりに再生する。ハザードは時刻の関数なので、止めても戻しても同じ絵になる。
+const WATCH = { list: [], focus: 0, t: 0, playing: true, speed: 1, dur: 0, back: 'board', drag: false };
+const WL = { x: 150, y: 688, w: 980, h: 8 }; // タイムライン
+function ghostMarks(s){ // 部屋が替わった時刻と死んだ時刻
+  const rooms = [], deaths = [];
+  for (let i = 5; i < s.length; i += 5){ if (s[i + 1] !== s[i - 4]) rooms.push(s[i]); if (s[i - 1] === 1 && s[i + 4] === 0) deaths.push(s[i]); }
+  return { rooms, deaths, end: s[s.length - 5] };
+}
+function startWatch(list, focus){
+  if (!list) return; list = list.filter(g => g.s && g.s.length >= 10);
+  if (!list.length){ toast('再生できる走りがありません'); return; }
+  for (const g of list) g.marks = ghostMarks(g.s);
+  Object.assign(WATCH, { list, focus: Math.min(focus || 0, list.length - 1), t: 0, playing: true, speed: 1, dur: Math.max(...list.map(g => g.marks.end)) / 1000, back: state === 'done' ? 'done' : 'board', drag: false });
+  state = 'watch'; resetPieceState(); particles = []; trail = []; H.line3.hidden = true; setMsg();
+}
+function watchLast(){ // ゴール直後: 今の走り（＋それとは別の自己ベスト）
+  if (!lastRun) return;
+  const list = [{ name: lastRun.name, color: C.player, s: lastRun.s, t: lastRun.t, d: lastRun.d }];
+  if (best && best.s.length && Math.round(best.time * 1000) !== lastRun.t) list.push({ name: 'BEST', color: C.ghost, s: best.s, t: Math.round(best.time * 1000), d: best.deaths });
+  startWatch(list, 0);
+}
+function endWatch(){ state = WATCH.back; if (state === 'done'){ H.line3.hidden = false; setMsg(doneBest); } else { BOARD.pollAt = 0; setMsg(); } }
+function watchKey(k, e){
+  const W = WATCH;
+  if (k === ' '){ e.preventDefault(); if (W.t >= W.dur) W.t = 0; W.playing = !W.playing; }
+  else if (k === 'arrowleft') W.t = Math.max(0, W.t - (e.shiftKey ? 5 : 1));
+  else if (k === 'arrowright') W.t = Math.min(W.dur, W.t + (e.shiftKey ? 5 : 1));
+  else if (k === 'arrowup' || k === 'arrowdown' || k === 'tab'){ e.preventDefault(); const n = W.list.length; W.focus = (W.focus + (k === 'arrowup' ? n - 1 : 1)) % n; }
+  else if (k === '1') W.speed = 0.5; else if (k === '2') W.speed = 1; else if (k === '3') W.speed = 2;
+  else if (k === 'r'){ W.t = 0; W.playing = true; }
+  else if (k === 'b' || k === 'escape' || k === 'm') endWatch();
+}
+function watchPanel(){ return { x: T.W - 250, y: 60, w: 236, h: 20 + WATCH.list.length * 26 }; }
+function watchUpdate(now, dt){
+  uiCursor(now); const W = WATCH;
+  if (W.playing){ W.t += dt * W.speed; if (W.t >= W.dur){ W.t = W.dur; W.playing = false; } }
+  for (const p of clicks){
+    const pn = watchPanel(), i = Math.floor((p.y - pn.y - 10) / 26);
+    if (inRect(p, { x: WL.x - 12, y: WL.y - 18, w: WL.w + 24, h: WL.h + 36 })){ W.drag = true; W.t = clamp01((p.x - WL.x) / WL.w) * W.dur; } // タイムラインはつかんで動かせる
+    else if (inRect(p, pn) && i >= 0 && i < W.list.length) W.focus = i;
+  }
+  if (ups.length || !have) W.drag = false;
+  if (W.drag) W.t = clamp01((cur.x - WL.x) / WL.w) * W.dur;
+  clicks.length = 0; ups.length = 0;
+  const f = W.list[W.focus], fp = poseAt(f.s, W.t * 1000);
+  H.time.textContent = fmt(Math.min(W.t, f.marks.end / 1000)); H.room.textContent = `ROOM ${Math.min(ROOMS.length, fp.room + 1)}/${ROOMS.length}`; H.name.textContent = 'REPLAY · ' + f.name;
+  draw(now, null, [], 0);
+}
+function drawReplayGhost(g, ms, ri, alpha){
+  const p = poseAt(g.s, ms); if (!p || p.room !== ri) return;
+  // 尻尾は直近 TRAIL_LIFE 秒の位置を時刻から直接描く（シークしても正しい）
+  const n = Math.round(T.TRAIL_LIFE * 30); ctx.save(); ctx.fillStyle = g.color;
+  for (let k = n; k >= 1; k--){ const tm = ms - k * 1000 / 30; if (tm < 0) continue; const q = poseAt(g.s, tm); if (!q || q.room !== ri || !q.alive) continue; const fr = 1 - k / n; ctx.globalAlpha = alpha * 0.9 * fr; ctx.beginPath(); ctx.arc(q.x, q.y, T.TRAIL_R * (0.3 + 0.7 * fr), 0, TAU); ctx.fill(); }
+  ctx.restore();
+  if (!p.alive){ // 死んだ場所に×
+    let dt0 = -1; for (const d of g.marks.deaths) if (d <= ms) dt0 = d; const q = dt0 >= 0 ? poseAt(g.s, dt0 - 1) : null;
+    if (q && q.room === ri){ ctx.save(); ctx.globalAlpha = alpha; ctx.beginPath(); ctx.moveTo(q.x - 9, q.y - 9); ctx.lineTo(q.x + 9, q.y + 9); ctx.moveTo(q.x + 9, q.y - 9); ctx.lineTo(q.x - 9, q.y + 9); ctx.strokeStyle = C.haz; ctx.lineWidth = 3; ctx.stroke(); ctx.restore(); }
+  }
+  head(p.x, p.y, g.color, alpha, !p.alive);
+  ctx.save(); ctx.globalAlpha = alpha; text(g.name, p.x, p.y - 18, 12, g.color, 'center', 500); ctx.restore();
+}
+function drawWatch(now){
+  const W = WATCH, ms = W.t * 1000, f = W.list[W.focus], fp = poseAt(f.s, ms), ri = Math.min(ROOMS.length - 1, fp.room), room = ROOMS[ri], entry = roomEntry(ri);
+  if (ri === 0) pad(START.x, START.y, T.PAD_R, C.start, 'START', false); else pad(entry.x, entry.y, T.PAD_R, C.cp, 'IN', false);
+  for (const c of room.cps) pad(c.x, c.y, T.PAD_R, C.cp, 'CP', false);
+  if (ri === ROOMS.length - 1) goal(room.exit.x, room.exit.y, T.PAD_R); else pad(room.exit.x, room.exit.y, T.PAD_R, C.exit, 'EXIT', true);
+  drawPieces(room.pieces, prims(room, W.t), W.t);
+  W.list.forEach((g, i) => { if (i !== W.focus) drawReplayGhost(g, ms, ri, 0.55); }); drawReplayGhost(f, ms, ri, 1);
+  text('REPLAY', T.W / 2, 34, 22, C.dim, 'center');
+  // 走りの一覧（クリックか ↑↓ で追う相手を替える）
+  const pn = watchPanel(); panel(pn.x, pn.y, pn.w, pn.h);
+  W.list.forEach((g, i) => {
+    const y = pn.y + 23 + i * 26; if (i === W.focus){ ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(pn.x + 2, y - 13, pn.w - 4, 26); }
+    ctx.beginPath(); ctx.arc(pn.x + 18, y, 6, 0, TAU); ctx.fillStyle = g.color; ctx.fill();
+    text(g.name, pn.x + 32, y, 14, C.fg, 'left', 500); text(fmt(g.t / 1000), pn.x + pn.w - 14, y, 14, C.exit, 'right');
+  });
+  // タイムライン: 白線=部屋の切り替わり、赤=死亡、三角=各走りのゴール
+  const X = t => WL.x + WL.w * (W.dur ? Math.min(1, t / (W.dur * 1000)) : 0);
+  panel(WL.x - 96, WL.y - 26, WL.w + 192, 52);
+  ctx.fillStyle = C.grid; ctx.fillRect(WL.x, WL.y, WL.w, WL.h);
+  ctx.fillStyle = f.color; ctx.globalAlpha = 0.55; ctx.fillRect(WL.x, WL.y, X(Math.min(ms, f.marks.end)) - WL.x, WL.h); ctx.globalAlpha = 1;
+  ctx.fillStyle = C.fg; for (const t of f.marks.rooms) ctx.fillRect(X(t) - 1, WL.y - 6, 2, WL.h + 12);
+  ctx.fillStyle = C.haz; for (const t of f.marks.deaths) ctx.fillRect(X(t) - 1.5, WL.y - 3, 3, WL.h + 6);
+  for (const g of W.list){ const gx = X(g.marks.end); ctx.fillStyle = g.color; ctx.beginPath(); ctx.moveTo(gx, WL.y - 4); ctx.lineTo(gx - 5, WL.y - 13); ctx.lineTo(gx + 5, WL.y - 13); ctx.closePath(); ctx.fill(); }
+  ctx.beginPath(); ctx.arc(X(ms), WL.y + WL.h / 2, 8, 0, TAU); ctx.fillStyle = C.fg; ctx.fill();
+  text(W.playing ? '▶' : '❚❚', WL.x - 70, WL.y + 4, 16, C.fg, 'center'); text('×' + W.speed, WL.x - 34, WL.y + 4, 14, C.dim, 'center');
+  text(fmt(W.t) + ' / ' + fmt(W.dur), WL.x + WL.w + 86, WL.y + 4, 13, C.dim, 'right', 500);
+}
+
 function draw(now, room, ps, ht, level, env){
   const { s, ox, oy, dpr } = view;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -895,7 +1701,10 @@ function draw(now, room, ps, ht, level, env){
   for (let x = 80; x < T.W; x += 80){ ctx.moveTo(x, 0); ctx.lineTo(x, T.H); }
   for (let y = 80; y < T.H; y += 80){ ctx.moveTo(0, y); ctx.lineTo(T.W, y); }
   ctx.stroke();
-  if (state === 'menu'){ drawMenu(now); drawTrail(trail, C.player, 0.9, now); if (have) head(cur.x, cur.y, C.player, 1, false); }
+  if (state === 'menu' || state === 'board' || state === 'watch'){
+    if (state === 'menu') drawMenu(now); else if (state === 'board') drawBoard(now); else drawWatch(now);
+    drawTrail(trail, C.player, 0.9, now); if (have) head(cur.x, cur.y, C.player, 1, false);
+  }
   else if (state === 'mp') drawMulti(now, ps, ht, level || []);
   else drawSingle(now, room, ps, ht);
   // レターボックス外を暗く
@@ -906,6 +1715,9 @@ function draw(now, room, ps, ht, level, env){
 }
 
 if (!ctx.roundRect) ctx.roundRect = function(x, y, w, h, r){ this.moveTo(x + r, y); this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r); this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r); this.closePath(); };
+// ===================== 起動 =====================
+setMsg(); for (const c of COURSES) loadBest(c); // 旧形式の自己ベストがあれば引き継ぐ
+netInit(); ensureDaily(today());
 function loop(now){ try { update(now); } catch (e) { console.error(e); } requestAnimationFrame(loop); }
 requestAnimationFrame(loop);
 </script>

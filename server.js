@@ -191,11 +191,86 @@ class Room {
   }
 }
 
+// ---- ランキング（デイリー／固定コース）----
+// 1コース(キー)＝1つの表。1人(pid)につき自己ベスト1件と、その走りのゴースト（圧縮済みの文字列）を持つ。
+//   GET  /api/ping                → { cursorrun, now }
+//   GET  /api/board/<key>         → { now, rows:[{pid,name,t,d,ts}] }  上位100件
+//   POST /api/board/<key>         ← { pid, token, name, t, d, g }  → { ok, rows } | { ok:false, err }
+//   GET  /api/ghost/<key>/<pid>   → { g }
+// 保存先は DATA_DIR（既定 ./data）。boards/<key>.json と ghosts/<key>/<pid>.txt。
+// タイムの正しさは検証しない（身内用）。防ぐのは「他人の記録の上書き」と「壊れたデータ」だけ。
+const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
+const RANK = { TZ_MIN: 540, GRACE: 15 * 60000, MAX_ROWS: 500, MAX_G: 110000, MAX_BODY: 200000, GH_HZ: 30, GH_MAX: 18000 };
+const boards = new Map(); // key → Map(pid → { pid, name, t, d, ts, th })
+const keyOk = k => /^[\w-]{3,64}$/.test(k), pidOk = p => /^[\w-]{6,40}$/.test(p);
+const dayKeyAt = ms => new Date(ms + RANK.TZ_MIN * 60000).toISOString().slice(0, 10);
+function boardOf(key){
+  let b = boards.get(key);
+  if (!b){ b = new Map(); try { for (const e of JSON.parse(fs.readFileSync(path.join(DATA, 'boards', key + '.json'), 'utf8'))) b.set(e.pid, e); } catch (e) {} boards.set(key, b); }
+  return b;
+}
+function saveBoard(key){
+  const dir = path.join(DATA, 'boards'), fp = path.join(dir, key + '.json');
+  fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(fp + '.tmp', JSON.stringify([...boardOf(key).values()])); fs.renameSync(fp + '.tmp', fp);
+}
+const sorted = key => [...boardOf(key).values()].sort((a, b) => a.t - b.t || a.ts - b.ts);
+const rowsOf = key => sorted(key).slice(0, 100).map(e => ({ pid: e.pid, name: e.name, t: e.t, d: e.d, ts: e.ts }));
+const ghostFile = (key, pid) => path.join(DATA, 'ghosts', key, pid + '.txt');
+// ゴーストの形だけ確かめる: 版1・30Hz・長さがヘッダーと合う・長さがタイムと合う
+function ghostOk(g, t){
+  if (typeof g !== 'string' || g.length < 12 || g.length > RANK.MAX_G || !/^[A-Za-z0-9+/]+=*$/.test(g)) return false;
+  const b = Buffer.from(g, 'base64'); if (b.length < 7 || b[0] !== 1 || b[1] !== RANK.GH_HZ) return false;
+  const n = b[2] | b[3] << 8; if (b.length !== 4 + n * 3) return false;
+  return n === RANK.GH_MAX || Math.abs((n - 1) * 1000 / RANK.GH_HZ - t) < 1500;
+}
+function submitScore(key, m){
+  const now = Date.now(), day = /^d-(\d{4}-\d\d-\d\d)-/.exec(key);
+  // デイリーは当日(JST)だけ受け付ける。日付をまたいだ直後の走りのために少しだけ猶予を持つ
+  if (day && day[1] !== dayKeyAt(now) && day[1] !== dayKeyAt(now - RANK.GRACE)) return { ok: false, err: 'このデイリーの受付は終わりました' };
+  const pid = String(m.pid || ''), token = String(m.token || ''), t = Math.round(+m.t), d = Math.round(+m.d), name = String(m.name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 12);
+  if (!pidOk(pid) || token.length < 8 || token.length > 80 || !name || !(t >= 500 && t <= 3600000) || !(d >= 0 && d <= 9999) || !ghostOk(m.g, t)) return { ok: false, err: '記録の形式が正しくありません' };
+  const b = boardOf(key), th = crypto.createHash('sha256').update(token).digest('hex'), cur = b.get(pid);
+  if (cur && cur.th !== th) return { ok: false, err: 'この記録は別の端末のものです' };
+  if (cur && t >= cur.t && cur.name === name) return { ok: true, rows: rowsOf(key) };
+  if (!cur && b.size >= RANK.MAX_ROWS){ // 満員なら最下位と入れ替え
+    const worst = sorted(key).pop(); if (t >= worst.t) return { ok: false, err: 'ランキングが満員です' };
+    b.delete(worst.pid); try { fs.unlinkSync(ghostFile(key, worst.pid)); } catch (e) {}
+  }
+  if (!cur || t < cur.t){
+    fs.mkdirSync(path.dirname(ghostFile(key, pid)), { recursive: true }); fs.writeFileSync(ghostFile(key, pid), m.g);
+    b.set(pid, { pid, name, t, d, ts: now, th });
+  } else cur.name = name; // タイムは据え置きで名前だけ変更
+  saveBoard(key);
+  return { ok: true, rows: rowsOf(key) };
+}
+function api(req, res, parts){
+  const json = (code, o) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o)); };
+  const [what, key, pid] = parts;
+  if (what === 'ping' && parts.length === 1) return json(200, { cursorrun: 1, now: Date.now() });
+  if (what === 'board' && parts.length === 2 && keyOk(key)){
+    if (req.method === 'GET') return json(200, { now: Date.now(), rows: rowsOf(key) });
+    if (req.method === 'POST'){
+      let body = '', over = false;
+      req.on('data', ch => { if (over) return; body += ch; if (body.length > RANK.MAX_BODY){ over = true; json(413, { ok: false, err: 'データが大きすぎます' }); req.destroy(); } });
+      req.on('end', () => { if (over) return; let m; try { m = JSON.parse(body); } catch (e) { return json(400, { ok: false, err: '記録の形式が正しくありません' }); }
+        try { const r = submitScore(key, m || {}); json(r.ok ? 200 : 400, { now: Date.now(), ...r }); } catch (e) { console.error(e); json(500, { ok: false, err: 'サーバーで保存に失敗しました' }); } });
+      return;
+    }
+  }
+  if (what === 'ghost' && parts.length === 3 && keyOk(key) && pidOk(pid) && req.method === 'GET'){
+    try { return json(200, { g: fs.readFileSync(ghostFile(key, pid), 'utf8') }); } catch (e) { return json(404, { err: 'not found' }); }
+  }
+  json(404, { err: 'not found' });
+}
+
 // ---- HTTP (静的配信) + WebSocket ----
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.md': 'text/plain; charset=utf-8', '.json': 'application/json' };
 const server = http.createServer((req, res) => {
-  let file = decodeURIComponent(req.url.split('?')[0]); if (file === '/') file = '/index.html';
+  let file; try { file = decodeURIComponent(req.url.split('?')[0]); } catch (e) { res.writeHead(400); res.end('bad request'); return; }
+  if (file.startsWith('/api/')) return api(req, res, file.slice(5).split('/'));
+  if (file === '/') file = '/index.html';
   const fp = path.join(__dirname, path.normalize(file));
+  if (/^\/(data|node_modules)(\/|$)|\/\./.test(file)){ res.writeHead(404); res.end('not found'); return; } // 記録の保存先などは配信しない
   if (!fp.startsWith(__dirname) || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()){ res.writeHead(404); res.end('not found'); return; }
   res.writeHead(200, { 'Content-Type': MIME[path.extname(fp)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
   fs.createReadStream(fp).pipe(res);
