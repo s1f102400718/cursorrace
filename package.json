@@ -4,7 +4,7 @@
   "version": "0.4.0",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js && node pieces.test.js && node daily.test.js && node board.test.js && node e2e.js && node smoke.js",
+    "test": "node test.js && node pieces.test.js && node daily.test.js && node shake.test.js && node board.test.js && node e2e.js && node smoke.js",
     "shots": "node scripts/shots.js",
     "build": "node scripts/build-artifact.js"
   },

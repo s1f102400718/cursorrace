@@ -52,6 +52,8 @@ const TEMPLATES = [
   { name: '予告付き床', make: () => ({ t: 'warnfloor', x: -130, y: -90, w: 260, h: 180, period: rnd(2.4, 3.6), duty: 0.3, warn: 0.6, phase: Math.random() }) },
   { name: '追跡者', make: () => ({ t: 'chaser', x: 0, y: 0, speed: 170, r: 18 }) },
   { name: '自分の影', make: () => ({ t: 'shadow', x: 0, y: 0, delay: 1.5, r: 10 }) },
+  // --- 2026-11-23: 画面を端から端まで貫くレーザー。照射中は画面が揺れる（揺れは見た目だけ）---
+  { name: '横断レーザー', make: () => ({ t: 'beam', x: 0, y: 0, deg: [0, 90, 45, 135][Math.floor(Math.random() * 4)], thick: 14, warn: 0.8, on: 0.8, off: rnd(1.4, 2.2), phase: Math.random() }) },
   { name: '速度制限区画', sizable: true, make: () => ({ t: 'speedzone', x: 0, y: 0, w: 240, h: 180, limit: 400 }) },
   { name: '停止禁止区画', sizable: true, make: () => ({ t: 'nostop', x: 0, y: 0, w: 240, h: 180, min: 150, grace: 0.5 }) },
 ];
@@ -67,7 +69,7 @@ function bounds(p){
     case 'gate': { const r = p.thick / 2; return { x: Math.min(p.ax, p.bx) - r, y: Math.min(p.ay, p.by) - r, w: Math.abs(p.ax - p.bx) + 2 * r, h: Math.abs(p.ay - p.by) + 2 * r }; }
     case 'shooter': { const ex = p.x + p.dx * p.range, ey = p.y + p.dy * p.range, r = p.r; return { x: Math.min(p.x, ex) - r, y: Math.min(p.y, ey) - r, w: Math.abs(ex - p.x) + 2 * r, h: Math.abs(ey - p.y) + 2 * r }; }
     // 図鑑採用分。回転レーザー/狙い撃ち/影は本体(ハブ)だけを占有扱いにする（効果範囲は広くてよい）
-    case 'rotlaser': case 'aimed': case 'shadow': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
+    case 'rotlaser': case 'aimed': case 'shadow': case 'beam': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
     case 'rain': return { x: p.x, y: 0, w: p.w, h: T.H };
     case 'slidelaser': return { x: p.x - p.dx / 2 - p.thick, y: p.y - p.len / 2, w: p.dx + 2 * p.thick, h: p.len };
     case 'crusher': return { x: p.x, y: p.y - p.h / 2, w: p.w, h: p.h };
@@ -95,8 +97,10 @@ function materialize(rel, m){
 function placementOk(p){
   const b = bounds(p), mustFit = ['wall', 'blink', 'slider', 'gate', 'crusher', 'slidelaser', 'warnfloor', 'speedzone', 'nostop', 'rain'].includes(p.t);
   if (mustFit && (b.x < 0 || b.y < 0 || b.x + b.w > T.W || b.y + b.h > T.H)) return false;
+  if (p.t === 'beam' && (beamNear(p, START, T.PAD_R + 10) || beamNear(p, GOAL, T.PAD_R + 10))) return false; // パッドを貫く置き方は不可
   return rectCircleClear(b, START, T.PAD_R + 10) && rectCircleClear(b, GOAL, T.PAD_R + 10);
 }
+function beamNear(p, c, r){ const a = (p.deg || 0) * Math.PI / 180; return Math.abs((c.x - p.x) * Math.sin(a) - (c.y - p.y) * Math.cos(a)) <= r + p.thick / 2; }
 
 // ---- 部屋 ----
 const rooms = new Map();

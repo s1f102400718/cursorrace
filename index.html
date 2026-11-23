@@ -76,6 +76,12 @@ const T = {
   COUNTDOWN: 2.0,      // スタートパッド静止秒
   GHOST_HZ: 30,        // ゴースト記録レート
   POS_HZ: 20,          // マルチ: カーソル送信レート
+  // 画面の振動（見た目だけ。当たり判定にもカーソルの位置にも一切使わない）
+  SHAKE: {
+    MAX: 12,                                              // 合計の揺れ幅の上限(px)
+    DEFAULT: { beam: 7, rotlaser: 4, crusher: 5, mine: 9 }, // shake を書いていないピースの揺れ幅(px)。0 か未記載なら揺れない
+    LENS_R0: 90, LENS_R1: 230, LENS_STEPS: 14,            // カーソルから R0 までは揺らさず、R1 にかけて段階的に揺れへつなぐ（段の数）
+  },
 };
 const COURSE_VER = 'v0.2';
 
@@ -101,6 +107,9 @@ const COURSE_VER = 'v0.2';
 // shadow    自分の影（各自判定）                                     x,y(目印),delay,r
 // speedzone 速度制限区画（範囲指定）                                 x,y,w,h,limit
 // nostop    停止禁止区画（範囲指定）                                 x,y,w,h,min,grace
+// --- 2026-11-23 ---
+// beam      横断レーザー: (x,y) を通り画面を端から端まで貫く。予告→照射→休み   x,y,deg,thick,warn,on,off,phase
+// どのピースにも shake（揺れ幅px）を書ける。「撃っている間」「叩きつけた瞬間」など型ごとの山で画面が揺れる（shakeEnv）。
 const TAU = Math.PI * 2;
 function osc(t, period, phase){ return (1 - Math.cos(TAU * (t / period + (phase || 0)))) / 2; }
 function frac(v){ return (v % 1 + 1) % 1; }
@@ -110,6 +119,7 @@ const PSTATE = new Map();
 const stateOf = p => { const k = p.id || p; let s = PSTATE.get(k); if (!s){ s = {}; PSTATE.set(k, s); } return s; };
 function resetPieceState(){ PSTATE.clear(); }
 function rotlaserState(p, t){ const cyc = p.on + p.warn + p.off, ph = frac(t / cyc + (p.phase || 0)) * cyc, a = t * p.rpm * TAU / 60 + (p.phase || 0) * TAU; return { a, warn: ph < p.warn, on: ph >= p.warn && ph < p.warn + p.on }; }
+function beamState(p, t){ const cyc = p.on + p.warn + p.off, ph = frac(t / cyc + (p.phase || 0)) * cyc, a = (p.deg || 0) * Math.PI / 180; return { dx: Math.cos(a), dy: Math.sin(a), warn: ph < p.warn, on: ph >= p.warn && ph < p.warn + p.on }; }
 function historyAt(env, delay){ const h = env.history, tt = env.t - delay; if (!h.length || h[0].t > tt) return null; let i = h.length - 1; while (i > 0 && h[i].t > tt) i--; return h[i]; }
 // 状態更新。env = { t, dt, cur, prev, have, speed, history }
 function stepPieces(pieces, env){
@@ -138,6 +148,7 @@ function prims(room, t, env){
     switch (p.t){
       case 'aimed': { const s = stateOf(p); for (const b of (s.b || [])) out.push({ k: 'circ', x: b.x, y: b.y, r: p.r, c: 'haz', src: p }); break; }
       case 'rotlaser': { const st = rotlaserState(p, t); if (st.on) out.push({ k: 'cap', ax: p.x, ay: p.y, bx: p.x + Math.cos(st.a) * p.len, by: p.y + Math.sin(st.a) * p.len, r: p.thick / 2, c: 'laser', src: p }); break; }
+      case 'beam': { const st = beamState(p, t); if (st.on) out.push({ k: 'cap', ax: p.x - st.dx * 1700, ay: p.y - st.dy * 1700, bx: p.x + st.dx * 1700, by: p.y + st.dy * 1700, r: p.thick / 2, c: 'laser', src: p }); break; }
       case 'rain': { const life = (T.H + 2 * p.r) / p.speed, kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - life) / p.interval));
         for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0) continue; const y = -p.r + p.speed * age; if (y > T.H + p.r) continue; out.push({ k: 'circ', x: p.x + hash(k * 7 + (p.seed || 1) * 131) * p.w, y, r: p.r, c: 'haz', src: p }); } break; }
       case 'slidelaser': { const cx = p.x - p.dx / 2 + p.dx * osc(t, p.period, p.phase); out.push({ k: 'cap', ax: cx, ay: p.y - p.len / 2, bx: cx, by: p.y + p.len / 2, r: p.thick / 2, c: 'laser', src: p }); break; }
@@ -174,6 +185,37 @@ function prims(room, t, env){
   }
   return out;
 }
+// ---- 画面の振動: ピースごとの「山」(0..1) と、部屋全体の揺れ ----
+// 揺れは時刻だけで決まる（リプレイで止めても戻しても同じ）。判定とカーソルには関わらない。
+const SHAKE = { on: true, gain: 1, lens: true }; // 設定（V で切替、[ ] で強さ、ラボでは L でカーソル周りの固定を切替）
+function fireEnv(k, on){ // 照射の山。k = 照射開始からの秒。立ち上がり 50ms、照射中は少し落ち着き、終わりは余韻
+  if (k < 0) return 0;
+  if (k <= on) return Math.min(1, k / 0.05) * (0.72 + 0.28 * Math.exp(-k * 7));
+  return 0.72 * Math.exp(-(k - on) * 12);
+}
+function shakeEnv(p, t){
+  switch (p.t){
+    case 'beam': case 'rotlaser': { const cyc = p.on + p.warn + p.off; return fireEnv(frac(t / cyc + (p.phase || 0)) * cyc - p.warn, p.on); } // 照射している間だけ（予告中は揺れない）
+    case 'gate': case 'blink': case 'warnfloor': return fireEnv(frac(t / p.period + (p.phase || 0)) * p.period, p.duty * p.period); // 点いている間
+    case 'crusher': return Math.exp(-frac(t / p.period + (p.phase || 0) - 0.5) * p.period * 9);  // 顎が閉じきった瞬間
+    case 'slider': return Math.exp(-frac(2 * (t / p.period + (p.phase || 0))) * p.period / 2 * 9); // 端に当たった瞬間
+    case 'pulser': return Math.exp(-frac(t / p.period + (p.phase || 0) - 0.5) * p.period * 8);   // 膨らみきった瞬間
+    case 'shooter': return Math.exp(-frac(t / p.interval + (p.phase || 0)) * p.interval * 16);   // 1発ごとの反動
+    case 'aimed': return t > 0 ? Math.exp(-frac(t / p.interval) * p.interval * 16) : 0;
+    case 'mine': { const s = PSTATE.get(p.id || p), ph = s && s.ph; return ph === 'blast' ? 1 : ph === 'armed' ? 0.2 : 0; } // 爆発中
+  }
+  return 1; // 山のない型は、shake を書いたら出ている間ずっと揺れる
+}
+function roomShake(pieces, t){ // 部屋全体の揺れ幅(px)。複数が重なったら二乗和で足す
+  if (!SHAKE.on) return 0; let e = 0;
+  for (const p of pieces){ const a = p.shake !== undefined ? p.shake : (T.SHAKE.DEFAULT[p.t] || 0); if (a > 0){ const v = a * shakeEnv(p, t); e += v * v; } }
+  return Math.min(T.SHAKE.MAX, Math.sqrt(e)) * SHAKE.gain;
+}
+function shakeOffset(amp, t){ // 揺れ幅と時刻 → ずらす量。周波数の違う波を重ねて不規則に見せる
+  if (!(amp > 0.05)) return { x: 0, y: 0, amp: 0 };
+  return { x: amp * (Math.sin(t * 107.3 + 1.3) + 0.6 * Math.sin(t * 183.1 + 4.1)) / 1.6, y: amp * (Math.sin(t * 119.7 + 2.9) + 0.6 * Math.sin(t * 151.9 + 0.7)) / 1.6, amp };
+}
+
 // 設置の検証（server.js と同じもの）
 function bounds(p){
   switch (p.t){
@@ -184,7 +226,7 @@ function bounds(p){
     case 'orbit': { const r = p.R + p.r; return { x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }; }
     case 'gate': { const r = p.thick / 2; return { x: Math.min(p.ax, p.bx) - r, y: Math.min(p.ay, p.by) - r, w: Math.abs(p.ax - p.bx) + 2 * r, h: Math.abs(p.ay - p.by) + 2 * r }; }
     case 'shooter': { const ex = p.x + p.dx * p.range, ey = p.y + p.dy * p.range, r = p.r; return { x: Math.min(p.x, ex) - r, y: Math.min(p.y, ey) - r, w: Math.abs(ex - p.x) + 2 * r, h: Math.abs(ey - p.y) + 2 * r }; }
-    case 'rotlaser': case 'aimed': case 'shadow': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
+    case 'rotlaser': case 'aimed': case 'shadow': case 'beam': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
     case 'rain': return { x: p.x, y: 0, w: p.w, h: T.H };
     case 'slidelaser': return { x: p.x - p.dx / 2 - p.thick, y: p.y - p.len / 2, w: p.dx + 2 * p.thick, h: p.len };
     case 'crusher': return { x: p.x, y: p.y - p.h / 2, w: p.w, h: p.h };
@@ -195,6 +237,8 @@ function bounds(p){
   }
   return { x: p.x, y: p.y, w: 0, h: 0 };
 }
+// 横断レーザーの線が点 c から r 以内を通るか（パッドを貫く置き方を禁止するため）
+function beamNear(p, c, r){ const a = (p.deg || 0) * Math.PI / 180; return Math.abs((c.x - p.x) * Math.sin(a) - (c.y - p.y) * Math.cos(a)) <= r + p.thick / 2; }
 const SIZABLE = new Set(['speedzone', 'nostop']);
 function translate(p, cx, cy){ const q = { ...p }; if (p.t === 'gate'){ q.ax += cx; q.bx += cx; q.ay += cy; q.by += cy; } else { q.x += cx; q.y += cy; } return q; }
 function rectCircleClear(b, c, r){ const dx = Math.max(b.x - c.x, 0, c.x - (b.x + b.w)), dy = Math.max(b.y - c.y, 0, c.y - (b.y + b.h)); return Math.hypot(dx, dy) > r; }
@@ -212,6 +256,7 @@ function materialize(rel, m){
 function placementOk(p, start, goal){
   const b = bounds(p), mustFit = ['wall', 'blink', 'slider', 'gate', 'crusher', 'slidelaser', 'warnfloor', 'speedzone', 'nostop', 'rain'].includes(p.t);
   if (mustFit && (b.x < 0 || b.y < 0 || b.x + b.w > T.W || b.y + b.h > T.H)) return false;
+  if (p.t === 'beam' && (beamNear(p, start, T.PAD_R + 10) || beamNear(p, goal, T.PAD_R + 10))) return false;
   return rectCircleClear(b, start, T.PAD_R + 10) && rectCircleClear(b, goal, T.PAD_R + 10);
 }
 // ドラッグ矩形 → 設置メッセージ。ほぼ動かさずに離したら既定サイズを中心に置く
@@ -342,6 +387,26 @@ const COURSES = [
     return out; })() },
 ]},
 ];
+// SK-1 振動ラボ: 画面の振動を試すための部屋（記録もランキングもなし）。メニューの「SK-1」か L キーで入る
+const LAB = { id: 'lab-shake', name: 'SK-1 SHAKE LAB', desc: '画面の振動を試す', lab: true, medals: [0, 0, 0], start: { x: 90, y: 360 }, rooms: [
+  { name: 'BEAMS', exit: { x: 1190, y: 360 }, cps: [{ x: 580, y: 360 }], pieces: [ // 横断レーザー: 撃っている間だけ揺れる。2組が交互に撃つ（周期 3.2 秒）
+    { t: 'beam', x: 400, y: 360, deg: 90, thick: 16, warn: 0.8, on: 0.9, off: 1.5, phase: 0 },
+    { t: 'beam', x: 640, y: 170, deg: 0, thick: 14, warn: 0.8, on: 0.7, off: 1.7, phase: 0 },
+    { t: 'beam', x: 760, y: 360, deg: 90, thick: 16, warn: 0.8, on: 0.9, off: 1.5, phase: 0.5 },
+    { t: 'beam', x: 1000, y: 360, deg: 60, thick: 12, warn: 0.8, on: 0.6, off: 1.8, phase: 0.5 },
+  ]},
+  { name: 'IMPACT', exit: { x: 90, y: 360 }, cps: [{ x: 690, y: 360 }], pieces: [ // 叩きつけ・端の衝突・発射の反動
+    { t: 'crusher', x: 780, y: 250, w: 170, h: 940, gap: 90, travel: 150, period: 2.4, phase: 0 },
+    { t: 'crusher', x: 430, y: 470, w: 170, h: 940, gap: 90, travel: 150, period: 2.0, phase: 0.4 },
+    { t: 'slider', x: 1010, y: 0, w: 40, h: 200, dy: 520, period: 1.8, phase: 0, shake: 4 },
+    { t: 'shooter', x: 300, y: -30, dx: 0, dy: 1, speed: 420, interval: 1.1, r: 12, range: 780, phase: 0, shake: 3 },
+  ]},
+  { name: 'SPIN', exit: { x: 1190, y: 360 }, cps: [], pieces: [ // 回転レーザーの照射と、膨らみきる脈動
+    { t: 'rotlaser', x: 640, y: 360, len: 430, rpm: 7, thick: 10, on: 1.8, warn: 0.7, off: 1.3, phase: 0 },
+    { t: 'pulser', x: 330, y: 150, rmin: 20, rmax: 95, period: 2.2, phase: 0, shake: 4 },
+    { t: 'pulser', x: 950, y: 570, rmin: 20, rmax: 95, period: 2.2, phase: 0.5, shake: 4 },
+  ]},
+]};
 let course = COURSES[0], ROOMS = course.rooms, START = course.start;
 function roomEntry(i){ return i === 0 ? START : ROOMS[i - 1].exit; }
 
@@ -449,6 +514,7 @@ function padSafe(pieces, c, rad){
       case 'stretch': if (ci(p.x, p.y, p.lmax / 2 + p.thick / 2)) return false; break;
       case 'pulser': if (ci(p.x, p.y, p.rmax)) return false; break;
       case 'rotlaser': if (ci(p.x, p.y, p.len + p.thick / 2)) return false; break;
+      case 'beam': if (beamNear(p, c, rad)) return false; break;
       case 'orbit': { const d = Math.hypot(c.x - p.x, c.y - p.y); if (!(d + rad < p.R - p.r || d - rad > p.R + p.r)) return false; break; }
       case 'gate': if (segPointDist(p.ax, p.ay, p.bx, p.by, c.x, c.y) <= p.thick / 2 + rad) return false; break;
       case 'shooter': if (segPointDist(p.x, p.y, p.x + p.dx * p.range, p.y + p.dy * p.range, c.x, c.y) <= p.r + rad) return false; break;
@@ -670,7 +736,10 @@ function decodeGhost(str){
 }
 
 // ===================== 状態 =====================
-const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
+const cvs = document.getElementById('c'), mainCtx = cvs.getContext('2d');
+// 描画関数はすべて ctx に描く。普段は画面、振動中だけ「揺らさない絵」を作るために fx（画面外の板）へ切り替える
+let ctx = mainCtx;
+const fx = document.createElement ? document.createElement('canvas') : null, fxCtx = fx ? fx.getContext('2d') : null;
 const H = { time: document.getElementById('hTime'), room: document.getElementById('hRoom'), name: document.getElementById('hName'), line3: document.getElementById('hLine3'),
   deaths: document.getElementById('hDeaths'), best: document.getElementById('hBest'), dbg: document.getElementById('hDbg'), msg: document.getElementById('msg'),
   keys: document.getElementById('keys'), toast: document.getElementById('toast') };
@@ -865,6 +934,7 @@ cvs.addEventListener('wheel', e => { if (state === 'board') BOARD.scroll += Math
 window.addEventListener('keydown', e => {
   if (OV.mode){ if (e.key === 'Escape') closeOv(); return; } // 名前入力中はゲームのキーを止める
   const k = e.key.toLowerCase();
+  if (shakeKey(k)) return;
   if (state === 'mp'){
     if (k === 'm') mpLeave();
     if (k === 'enter') mpKeyReady();
@@ -878,6 +948,7 @@ window.addEventListener('keydown', e => {
     if (k >= '1' && k <= '3' && COURSES[k - 1]) openBoard(COURSES[k - 1]);
     if (k === '4') mpEnter();
     if (k === 'n'){ e.preventDefault(); openName(); }
+    if (k === 'l') openLab();
     return;
   }
   if (state === 'board'){
@@ -896,11 +967,19 @@ window.addEventListener('keydown', e => {
   if (k === 'm') toMenu();
   if (k === 'b' || k === 'escape') openBoard(course);
   if (k === 'g') ghostOn = !ghostOn;
-  if (state === 'done'){ if (k === 'w') watchLast(); if (k === 'c') doShare(); }
+  if (k === 'l' && course.lab){ SHAKE.lens = !SHAKE.lens; toast('カーソル周りの固定 ' + (SHAKE.lens ? 'ON' : 'OFF')); }
+  if (state === 'done'){ if (k === 'w') watchLast(); if (k === 'c' && !course.lab) doShare(); }
 });
+// 振動の設定キー（どの画面でも効く）。V = 入/切、[ ] = 強さ。端末に覚えておく
+function shakeKey(k){
+  if (k === 'v'){ SHAKE.on = !SHAKE.on; LS.set('cursorrun.shake', SHAKE.on ? '1' : '0'); toast('画面の振動 ' + (SHAKE.on ? 'ON' : 'OFF')); return true; }
+  if (k === '[' || k === ']'){ SHAKE.gain = Math.max(0.25, Math.min(2, Math.round((SHAKE.gain + (k === ']' ? 0.25 : -0.25)) * 100) / 100)); LS.set('cursorrun.shakeGain', SHAKE.gain); toast('振動の強さ ×' + SHAKE.gain.toFixed(2)); return true; }
+  return false;
+}
 
 function toMenu(){ state = 'menu'; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
 function play(){ state = 'title'; H.line3.hidden = false; restart(); }
+function openLab(){ course = LAB; ROOMS = LAB.rooms; START = LAB.start; best = null; play(); }
 function restart(){
   if (state === 'menu' || state === 'board' || state === 'watch' || state === 'mp') return;
   state = 'title'; roomIdx = 0; cp = START; cpsHit = new Set(); deaths = 0; splits = []; elapsed = 0; deathMark = null; roomDeaths = ROOMS.map(() => 0);
@@ -930,6 +1009,7 @@ function finish(){
   const ms = Math.round(finalTime * 1000), key = boardKey(course), rec = loadRec(key);
   gRec.push(ms, roomIdx, Math.round(cur.x), Math.round(cur.y), 1); // ゴールの瞬間まで記録する
   lastRun = { name: myName(), s: gRec.slice(), t: ms, d: deaths };
+  if (course.lab){ doneBest = false; setMsg(false); return; } // ラボは記録もランキングもなし
   doneBest = !rec || ms < rec.t;
   if (doneBest){
     saveRec(key, { t: ms, d: deaths, ts: nowMs(), g: encodeGhost(gRec, ms), rd: roomDeaths.slice(), sent: '' });
@@ -943,15 +1023,16 @@ function fmt(t){ return t.toFixed(2); }
 function esc(s){ return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])); }
 const MEDAL_COLORS = { GOLD: '#ffd044', SILVER: '#cfd8e6', BRONZE: '#d08a4c' };
 const KEYS = {
-  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前',
+  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前 · L 振動ラボ',
   board: 'Enter スタート · W リプレイ · C 結果をコピー · N 名前 · M メニュー',
-  run: 'R リスタート · B ランキング · G ゴースト · M メニュー',
+  run: 'R リスタート · B ランキング · G ゴースト · V 振動 · M メニュー',
   watch: 'Space 一時停止 · ←→ 1秒(Shiftで5秒) · ↑↓ 切替 · 1/2/3 速度 · B 戻る',
 };
 function setMsg(isBest){
   msgVer = NET.ver;
   H.keys.textContent = state === 'mp' ? '' : KEYS[state] || KEYS.run;
   if (state === 'menu') H.msg.innerHTML = '<p>カードをクリックして選ぶ</p>';
+  else if (state === 'title' && course.lab) H.msg.innerHTML = '<h1>SK-1 SHAKE LAB</h1><p>レーザーの照射や叩きつけの瞬間に画面が揺れる。揺れるのは見た目だけで、カーソルの位置と当たり判定は動かない。</p><p>カーソルの周りは揺らさない絵（判定どおり）を出している。L で切り替えて見比べられる。記録は残らない。</p>';
   else if (state === 'title') H.msg.innerHTML = `<h1>${esc(course.name)}</h1><p>緑のパッドにカーソルを置くとカウントダウン。壁と赤いものに触れたら直前のパッドへ戻る。部屋の外に出ても死ぬ。</p><p>GOLD ${course.medals[0]}s · SILVER ${course.medals[1]}s · BRONZE ${course.medals[2]}s</p>`;
   else if (state === 'done'){
     const rows = splits.map((s, i) => `<span>${esc(ROOMS[i].name)}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}</span>`).join('');
@@ -1048,6 +1129,7 @@ function update(now){
     if (dc && NET.mode === 'api' && now > BOARD.menuPollAt){ BOARD.menuPollAt = now + 30000; netBoard(boardKey(dc)); }
     for (const c of clicks){
       if (inRect(c, menuNameChip())){ openName(); break; }
+      if (inRect(c, menuLabChip())){ openLab(); break; }
       for (const card of menuCards()) if (state === 'menu' && inRect(c, card)){ if (card.kind === 'course') openBoard(card.c); else if (card.kind === 'daily') openDaily(td); else mpEnter(); }
     }
   }
@@ -1262,9 +1344,11 @@ const DOW = '日月火水木金土';
 function hms(ms){ const s = Math.max(0, Math.floor(ms / 1000)), p = v => String(v).padStart(2, '0'); return p(Math.floor(s / 3600)) + ':' + p(Math.floor(s / 60) % 60) + ':' + p(s % 60); }
 function menuNameChip(){ return { x: T.W - 15 - 250, y: 46, w: 250, h: 40 }; }
 function chip(r, label, hover){ ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : C['wall-edge']; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 8); ctx.fill(); ctx.stroke(); text(label, r.x + r.w / 2, r.y + r.h / 2 + 1, 15, C.fg, 'center', 500); }
+function menuLabChip(){ return { x: 15, y: 582, w: 290, h: 40 }; }
 function drawMenu(now){
   text('CURSOR RUN', 15, 68, 46, C.fg);
   const nc = menuNameChip(); chip(nc, '名前  ' + myName() + '  ✎', have && inRect(cur, nc));
+  const lc = menuLabChip(); chip(lc, 'SK-1 画面の振動を試す（L）', have && inRect(cur, lc));
   for (const card of menuCards()){
     const hover = have && inRect(cur, card);
     ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : card.kind === 'daily' ? C.exit : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2;
@@ -1340,7 +1424,7 @@ function drawPieces(pieces, ps, t){
     } else if (pr.k === 'cap'){
       ctx.save(); ctx.lineCap = 'round';
       if (pr.c === 'laser'){
-        if (pr.on){ ctx.shadowColor = C.laser; ctx.shadowBlur = 16; ctx.strokeStyle = C.laser; ctx.lineWidth = pr.r * 2; }
+        if (pr.on !== false){ ctx.shadowColor = C.laser; ctx.shadowBlur = 16; ctx.strokeStyle = C.laser; ctx.lineWidth = pr.r * 2; } // on を持たないレーザー（回転・往復・横断）は出ている間ずっと点灯
         else { ctx.strokeStyle = C.laser; ctx.globalAlpha = 0.25; ctx.lineWidth = 2; ctx.setLineDash([4, 8]); }
       } else { ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.strokeStyle = C.haz; ctx.lineWidth = pr.r * 2; }
       ctx.beginPath(); ctx.moveTo(pr.ax, pr.ay); ctx.lineTo(pr.bx, pr.by); ctx.stroke(); ctx.restore();
@@ -1351,6 +1435,11 @@ function drawPieces(pieces, ps, t){
     if (p.t === 'shooter'){ ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 6, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 3; ctx.stroke(); }
     else if (p.t === 'stretch'){ ctx.beginPath(); ctx.arc(p.x, p.y, p.thick / 2 + 4, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.stroke(); }
     else if (p.t === 'rotlaser'){ const st = rotlaserState(p, t); if (st.warn){ ctx.save(); ctx.strokeStyle = C.laser; ctx.globalAlpha = 0.35 + 0.35 * Math.sin(t * 30); ctx.lineWidth = 2; ctx.setLineDash([8, 8]); ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + Math.cos(st.a) * p.len, p.y + Math.sin(st.a) * p.len); ctx.stroke(); ctx.restore(); } hub(p.x, p.y, st.a, true); }
+    else if (p.t === 'beam'){ // 通り道は常に薄く見せ、予告中は点滅、照射中は本体（prims）が光る
+      const st = beamState(p, t); ctx.save(); ctx.strokeStyle = C.laser; ctx.lineWidth = 2;
+      if (st.warn){ ctx.globalAlpha = 0.45 + 0.35 * Math.sin(t * 30); ctx.setLineDash([10, 8]); } else { ctx.globalAlpha = st.on ? 0 : 0.14; ctx.setLineDash([3, 10]); }
+      ctx.beginPath(); ctx.moveTo(p.x - st.dx * 1700, p.y - st.dy * 1700); ctx.lineTo(p.x + st.dx * 1700, p.y + st.dy * 1700); ctx.stroke(); ctx.restore();
+      hub(p.x, p.y, Math.atan2(st.dy, st.dx), true); }
     else if (p.t === 'aimed'){ const s = stateOf(p), last = s.b && s.b.length ? s.b[s.b.length - 1] : null; hub(p.x, p.y, last ? Math.atan2(last.vy, last.vx) : 0, true); }
     else if (p.t === 'mine'){ const s = stateOf(p), ph = s.ph || 'idle'; ctx.save(); ctx.beginPath(); ctx.arc(p.x, p.y, 10, 0, TAU); ctx.fillStyle = ph === 'cool' ? '#3a2a30' : '#5a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.globalAlpha = ph === 'cool' ? 0.3 : 1; ctx.stroke();
       if (ph === 'armed'){ ctx.globalAlpha = 0.4 + 0.4 * Math.sin(t * 40); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, p.y, p.blast, 0, TAU); ctx.stroke(); } ctx.restore(); }
@@ -1360,7 +1449,22 @@ function drawPieces(pieces, ps, t){
 }
 function pieceAnchor(p){ return p.t === 'gate' ? { x: (p.ax + p.bx) / 2, y: (p.ay + p.by) / 2 } : { x: p.x + (p.w ? p.w / 2 : 0), y: p.y + (p.h ? p.h / 2 : 0) }; }
 
-function drawSingle(now, room, ps, ht){
+// 描画は2層に分ける。layer 'world' = 部屋（振動で揺れる）、'over' = カーソルと表示類（揺れない）。
+// 当たり判定は揺れる前の座標で行うので、カーソルは実際のポインター位置から動かない。
+function drawSingle(now, room, ps, ht, layer){
+  if (layer === 'over'){
+    drawTrail(trail, C.player, 0.9, now);
+    if (have){
+      head(cur.x, cur.y, state === 'dead' ? C.ghost : C.player, 1, state === 'dead');
+      if (debug){ ctx.beginPath(); ctx.arc(cur.x, cur.y, T.HEAD_R, 0, TAU); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
+    }
+    if (course.lab){ // ラボ: いまの設定と操作
+      panel(330, 664, 620, 40);
+      text(`振動 ${SHAKE.on ? 'ON' : 'OFF'} · 強さ ×${SHAKE.gain.toFixed(2)} · カーソル周りの固定 ${SHAKE.lens ? 'ON' : 'OFF'}`, 350, 685, 14, C.fg, 'left', 500);
+      text('V 振動 · [ ] 強さ · L 固定', 930, 685, 13, C.dim, 'right', 500);
+    }
+    return;
+  }
   if (flyFlash > 0){ ctx.fillStyle = C.haz; ctx.globalAlpha = flyFlash * 0.25; ctx.fillRect(0, 0, T.W, T.H); ctx.globalAlpha = 1; }
   const entry = roomEntry(roomIdx);
   if (roomIdx === 0) pad(START.x, START.y, T.PAD_R, C.start, state === 'count' ? Math.ceil((countEnd - now) / 1000) + '' : 'START', state !== 'race');
@@ -1382,25 +1486,30 @@ function drawSingle(now, room, ps, ht){
   }
   if (deathMark && state === 'dead'){ ctx.beginPath(); ctx.moveTo(deathMark.x - 9, deathMark.y - 9); ctx.lineTo(deathMark.x + 9, deathMark.y + 9); ctx.moveTo(deathMark.x + 9, deathMark.y - 9); ctx.lineTo(deathMark.x - 9, deathMark.y + 9); ctx.strokeStyle = C.haz; ctx.lineWidth = 3; ctx.stroke(); }
   drawParticles();
-  drawTrail(trail, C.player, 0.9, now);
-  if (have){
-    head(cur.x, cur.y, state === 'dead' ? C.ghost : C.player, 1, state === 'dead');
-    if (debug){ ctx.beginPath(); ctx.arc(cur.x, cur.y, T.HEAD_R, 0, TAU); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
-  }
 }
 function drawParticles(){
   for (const p of particles){ ctx.globalAlpha = Math.min(1, p.life * 2); ctx.fillStyle = p.c === 'haz' ? C.haz : p.c; ctx.fillRect(p.x - 2, p.y - 2, 4, 4); }
   ctx.globalAlpha = 1;
 }
 function panel(x, y, w, h){ ctx.fillStyle = 'rgba(7,9,15,0.82)'; ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke(); }
-function drawMulti(now, ps, ht, level){
+function drawMulti(now, ps, ht, level, layer){
   const s = MP.snap, phase = s ? s.phase : 'connecting', pl = s ? s.players : [], colorOf = id => (pl.find(p => p.id === id) || {}).color || C.ghost;
   const myColor = MP.me ? MP.me.color : C.player;
+  if (layer === 'world'){ // 部屋と他プレイヤー（揺れる層）
+    if (s && phase !== 'lobby'){
+      pad(MP_START.x, MP_START.y, T.PAD_R, C.start, phase === 'count' ? Math.ceil(Math.max(0, (s.deadline - serverNow()) / 1000)) + '' : 'START', phase === 'count' || phase === 'run');
+      goal(MP_GOAL.x, MP_GOAL.y, T.PAD_R);
+      drawPieces(level, ps, ht);
+      for (const p of level) if (p.owner){ const a = pieceAnchor(p); ctx.beginPath(); ctx.arc(a.x, a.y, 5, 0, TAU); ctx.fillStyle = colorOf(p.owner); ctx.fill(); }
+      for (const p of pl){ if (p.id === MP.id) continue; const o = MP.others[p.id]; if (!o) continue;
+        const out = p.status === 'dead' || p.status === 'out';
+        drawTrail(o.trail, p.color, 0.6, now); head(o.x, o.y, p.color, out ? 0.5 : 0.9, out);
+        text(p.name, o.x, o.y - 18, 12, p.color, 'center', 500);
+      }
+    }
+    return;
+  }
   if (s && phase !== 'lobby'){
-    pad(MP_START.x, MP_START.y, T.PAD_R, C.start, phase === 'count' ? Math.ceil(Math.max(0, (s.deadline - serverNow()) / 1000)) + '' : 'START', phase === 'count' || phase === 'run');
-    goal(MP_GOAL.x, MP_GOAL.y, T.PAD_R);
-    drawPieces(level, ps, ht);
-    for (const p of level) if (p.owner){ const a = pieceAnchor(p); ctx.beginPath(); ctx.arc(a.x, a.y, 5, 0, TAU); ctx.fillStyle = colorOf(p.owner); ctx.fill(); }
     // 設置プレビュー（範囲指定はドラッグ矩形、それ以外はカーソル中心）
     if (phase === 'place' && MP.me && MP.me.pick !== null && !MP.me.placed && have){
       const b0 = s.box[MP.me.pick], rel = b0.piece;
@@ -1409,12 +1518,6 @@ function drawMulti(now, ps, ht, level){
         ctx.save(); ctx.globalAlpha = 0.75; drawPieces([piece], prims({ pieces: [piece] }, ht), ht); ctx.restore();
         ctx.strokeStyle = ok ? C.start : C.haz; ctx.lineWidth = 2; ctx.setLineDash([6, 6]); ctx.strokeRect(b.x, b.y, b.w, b.h); ctx.setLineDash([]);
         if (b0.sizable) text(MP.drag ? `${b.w}×${b.h}` : 'ドラッグで範囲指定・クリックで既定サイズ', b.x + b.w / 2, b.y - 12, 12, ok ? C.start : C.haz, 'center', 500); }
-    }
-    // 他プレイヤー
-    for (const p of pl){ if (p.id === MP.id) continue; const o = MP.others[p.id]; if (!o) continue;
-      const out = p.status === 'dead' || p.status === 'out';
-      drawTrail(o.trail, p.color, 0.6, now); head(o.x, o.y, p.color, out ? 0.5 : 0.9, out);
-      text(p.name, o.x, o.y - 18, 12, p.color, 'center', 500);
     }
   }
   drawParticles();
@@ -1458,7 +1561,8 @@ function drawMulti(now, ps, ht, level){
         text(b.name, card.x + card.w / 2, card.y + 22, 15, taken ? C.dim : C.fg, 'center');
         // ミニプレビュー
         const bb = bounds(b.piece), sc = Math.min(0.32, (card.w - 30) / Math.max(1, bb.w), (card.h - 70) / Math.max(1, bb.h));
-        ctx.save(); ctx.translate(card.x + card.w / 2, card.y + 42 + (card.h - 70) / 2); ctx.scale(sc, sc); ctx.translate(-(bb.x + bb.w / 2), -(bb.y + bb.h / 2));
+        ctx.save(); ctx.beginPath(); ctx.rect(card.x + 4, card.y + 36, card.w - 8, card.h - 62); ctx.clip(); // 長いレーザーがカードからはみ出さないように
+        ctx.translate(card.x + card.w / 2, card.y + 42 + (card.h - 70) / 2); ctx.scale(sc, sc); ctx.translate(-(bb.x + bb.w / 2), -(bb.y + bb.h / 2));
         if (taken) ctx.globalAlpha = 0.35; drawPieces([b.piece], prims({ pieces: [b.piece] }, ht), ht); ctx.restore();
         if (taken) text((pl.find(p => p.id === b.takenBy) || {}).name || '', card.x + card.w / 2, card.y + card.h - 14, 12, colorOf(b.takenBy), 'center', 500);
       });
@@ -1484,6 +1588,7 @@ const GHOST_COLORS = ['#ffb14a', '#b980ff', '#49e07c', '#ff7ab8', '#7cf5d6'], BO
 const BOARD = { sel: new Map(), scroll: 0, pollAt: 0, menuPollAt: 0, pending: null }; // sel: コース(キー) → 並走相手の pid の並び
 const BL = { x: 500, y: 150, w: 740, rh: 34, max: 11 }; // 順位表の位置と行数
 function openBoard(c){
+  if (c.lab){ toMenu(); return; } // ラボにランキングは無い
   course = c; ROOMS = c.rooms; START = c.start; best = loadBest(c); state = 'board'; BOARD.scroll = 0; BOARD.pollAt = 0; BOARD.pending = null; trail = []; particles = []; H.line3.hidden = true;
   ensureBot(c); syncRec(c); setMsg();
 }
@@ -1672,12 +1777,19 @@ function drawReplayGhost(g, ms, ri, alpha){
   head(p.x, p.y, g.color, alpha, !p.alive);
   ctx.save(); ctx.globalAlpha = alpha; text(g.name, p.x, p.y - 18, 12, g.color, 'center', 500); ctx.restore();
 }
-function drawWatch(now){
-  const W = WATCH, ms = W.t * 1000, f = W.list[W.focus], fp = poseAt(f.s, ms), ri = Math.min(ROOMS.length - 1, fp.room), room = ROOMS[ri], entry = roomEntry(ri);
-  if (ri === 0) pad(START.x, START.y, T.PAD_R, C.start, 'START', false); else pad(entry.x, entry.y, T.PAD_R, C.cp, 'IN', false);
-  for (const c of room.cps) pad(c.x, c.y, T.PAD_R, C.cp, 'CP', false);
-  if (ri === ROOMS.length - 1) goal(room.exit.x, room.exit.y, T.PAD_R); else pad(room.exit.x, room.exit.y, T.PAD_R, C.exit, 'EXIT', true);
-  drawPieces(room.pieces, prims(room, W.t), W.t);
+function watchView(){ // いま映す部屋と、追っている走りの位置
+  const W = WATCH, ms = W.t * 1000, f = W.list[W.focus], fp = poseAt(f.s, ms), ri = Math.min(ROOMS.length - 1, fp.room);
+  return { W, ms, f, fp, ri, room: ROOMS[ri] };
+}
+function drawWatch(now, layer){
+  const { W, ms, f, ri, room } = watchView(), entry = roomEntry(ri);
+  if (layer === 'world'){
+    if (ri === 0) pad(START.x, START.y, T.PAD_R, C.start, 'START', false); else pad(entry.x, entry.y, T.PAD_R, C.cp, 'IN', false);
+    for (const c of room.cps) pad(c.x, c.y, T.PAD_R, C.cp, 'CP', false);
+    if (ri === ROOMS.length - 1) goal(room.exit.x, room.exit.y, T.PAD_R); else pad(room.exit.x, room.exit.y, T.PAD_R, C.exit, 'EXIT', true);
+    drawPieces(room.pieces, prims(room, W.t), W.t);
+    return;
+  }
   W.list.forEach((g, i) => { if (i !== W.focus) drawReplayGhost(g, ms, ri, 0.55); }); drawReplayGhost(f, ms, ri, 1);
   // 走りの一覧（クリックか ↑↓ で追う相手を替える）
   const pn = watchPanel(); panel(pn.x, pn.y, pn.w, pn.h);
@@ -1699,25 +1811,62 @@ function drawWatch(now){
   text(fmt(W.t) + ' / ' + fmt(W.dur), WL.x + WL.w + 86, WL.y + 4, 13, C.dim, 'right', 500);
 }
 
+// いまの揺れ { x, y, amp } と、揺らさない絵を出す中心（カーソル。リプレイでは追っている走り）
+function shakeNow(room, ht, level){
+  let pieces = null, t = ht, c = have ? cur : null;
+  if (state === 'title' || state === 'race' || state === 'dead') pieces = room.pieces;
+  else if (state === 'mp'){ if (MP.snap && MP.snap.phase === 'run') pieces = level; }
+  else if (state === 'watch'){ const v = watchView(); pieces = v.room.pieces; t = v.W.t; c = v.fp.room === v.ri ? v.fp : null; }
+  const sh = pieces ? shakeOffset(roomShake(pieces, t), t) : { x: 0, y: 0, amp: 0 };
+  sh.c = c; return sh;
+}
 function draw(now, room, ps, ht, level, env){
-  const { s, ox, oy, dpr } = view;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { s, ox, oy, dpr } = view, base = () => ctx.setTransform(dpr * s, 0, 0, dpr * s, ox * dpr, oy * dpr);
+  const ui = state === 'menu' || state === 'board';
+  // 揺れる層: 格子と部屋
+  const world = () => {
+    const m = 40; // ずらしても端が欠けないよう、地と格子は部屋の少し外まで描く
+    ctx.fillStyle = C.arena; ctx.fillRect(-m, -m, T.W + 2 * m, T.H + 2 * m);
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = 0; x <= T.W; x += 80){ ctx.moveTo(x, -m); ctx.lineTo(x, T.H + m); }
+    for (let y = 0; y <= T.H; y += 80){ ctx.moveTo(-m, y); ctx.lineTo(T.W + m, y); }
+    ctx.stroke();
+    if (state === 'watch') drawWatch(now, 'world'); else if (state === 'mp') drawMulti(now, ps, ht, level || [], 'world'); else if (!ui) drawSingle(now, room, ps, ht, 'world');
+  };
+  const sh = ui ? { x: 0, y: 0, amp: 0 } : shakeNow(room, ht, level || []);
+  ctx = mainCtx; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cvs.width, cvs.height);
-  ctx.setTransform(dpr * s, 0, 0, dpr * s, ox * dpr, oy * dpr);
-  // arena
-  ctx.fillStyle = C.arena; ctx.fillRect(0, 0, T.W, T.H);
-  ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
-  for (let x = 80; x < T.W; x += 80){ ctx.moveTo(x, 0); ctx.lineTo(x, T.H); }
-  for (let y = 80; y < T.H; y += 80){ ctx.moveTo(0, y); ctx.lineTo(T.W, y); }
-  ctx.stroke();
-  if (state === 'menu' || state === 'board' || state === 'watch'){
-    if (state === 'menu') drawMenu(now); else if (state === 'board') drawBoard(now); else drawWatch(now);
+  base();
+  ctx.fillStyle = C.arena; ctx.fillRect(0, 0, T.W, T.H); // 地の色は揺らさない（端に隙間を作らない）
+  if (sh.amp > 0 && fxCtx){
+    // 振動中: 部屋を1回だけ別の板(fx)に「判定どおりの位置」で描き、それをずらして画面に貼る。
+    // カーソルの周りは同心円に切り分け、内側ほどずらす量を減らす（R0 より内側はずらさない）。
+    // だからカーソルの近くに見えているものは、いつも当たり判定と同じ位置にある。
+    const k = s * dpr, dx = sh.x * k, dy = sh.y * k, L = T.SHAKE, P = Math.ceil(30 * k); // P: 板の余白。ずらしても端が欠けないぶん大きく作る
+    if (fx.width !== cvs.width + 2 * P || fx.height !== cvs.height + 2 * P){ fx.width = cvs.width + 2 * P; fx.height = cvs.height + 2 * P; }
+    ctx = fxCtx; ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, fx.width, fx.height);
+    ctx.setTransform(k, 0, 0, k, ox * dpr + P, oy * dpr + P); world();
+    ctx = mainCtx; ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(fx, Math.round(dx) - P, Math.round(dy) - P);
+    if (sh.c && SHAKE.lens){
+      const cx = (ox + sh.c.x * s) * dpr, cy = (oy + sh.c.y * s) * dpr;
+      for (let i = L.LENS_STEPS - 1; i >= 0; i--){
+        const u = i / L.LENS_STEPS, f = u * u * (3 - 2 * u); // 外へ向かってなめらかに増やす
+        ctx.save(); ctx.beginPath(); ctx.arc(cx, cy, (L.LENS_R0 + (L.LENS_R1 - L.LENS_R0) * u) * k, 0, TAU); ctx.clip();
+        ctx.drawImage(fx, Math.round(dx * f) - P, Math.round(dy * f) - P); ctx.restore();
+      }
+    }
+    base();
+  } else world();
+  // 揺れない層: カーソルと表示類
+  if (ui || state === 'watch'){
+    if (state === 'menu') drawMenu(now); else if (state === 'board') drawBoard(now); else drawWatch(now, 'over');
     // リプレイ中は見ている人のカーソルを輪にする（再生中の自機と見分けるため）
     if (state === 'watch'){ if (have){ ctx.beginPath(); ctx.arc(cur.x, cur.y, 7, 0, TAU); ctx.strokeStyle = C.fg; ctx.lineWidth = 2; ctx.stroke(); } }
     else { drawTrail(trail, C.player, 0.9, now); if (have) head(cur.x, cur.y, C.player, 1, false); }
   }
-  else if (state === 'mp') drawMulti(now, ps, ht, level || []);
-  else drawSingle(now, room, ps, ht);
+  else if (state === 'mp') drawMulti(now, ps, ht, level || [], 'over');
+  else drawSingle(now, room, ps, ht, 'over');
   // レターボックス外を暗く
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#07090f';
@@ -1725,9 +1874,14 @@ function draw(now, room, ps, ht, level, env){
   if (oy > 0){ ctx.fillRect(0, 0, cvs.width, oy); ctx.fillRect(0, oy + T.H * s, cvs.width, oy + 1); }
 }
 
-if (!ctx.roundRect) ctx.roundRect = function(x, y, w, h, r){ this.moveTo(x + r, y); this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r); this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r); this.closePath(); };
+for (const c of [mainCtx, fxCtx]) if (c && !c.roundRect) c.roundRect = function(x, y, w, h, r){ this.moveTo(x + r, y); this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r); this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r); this.closePath(); };
 // ===================== 起動 =====================
 H.line3.hidden = true; setMsg(); for (const c of COURSES) loadBest(c); // 旧形式の自己ベストがあれば引き継ぐ
+{ // 振動の設定を読む。未設定なら、OS で「視差効果を減らす」にしている人は切で始める
+  const v = LS.get('cursorrun.shake'), g = parseFloat(LS.get('cursorrun.shakeGain'));
+  SHAKE.on = v ? v === '1' : !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  if (g >= 0.25 && g <= 2) SHAKE.gain = g;
+}
 netInit(); ensureDaily(today());
 function loop(now){ try { update(now); } catch (e) { console.error(e); } requestAnimationFrame(loop); }
 requestAnimationFrame(loop);
