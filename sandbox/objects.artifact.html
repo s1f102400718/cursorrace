@@ -1,0 +1,356 @@
+<title>Object Catalog Sandbox</title>
+<style>
+/* Layout: object list left, 16:9 arena center, parameter panel right. Single dark arcade theme by choice. */
+:root{
+  --bg:#07090f; --arena:#0d1220; --grid:#141b2d; --fg:#e6ecf5; --dim:#7d8aa3;
+  --wall:#2b3650; --wall-edge:#5a6d94; --haz:#ff3b5c; --bullet:#ff5c7a; --laser:#ff4fd8; --zone:#4fd3ff; --emit:#ffb84d; --player:#5ee1ff;
+  --panel:#0f1526; --line:#243052; --sel:#1b2742; --ok:#49e07c;
+  --font:ui-monospace,Consolas,"Chakra Petch",monospace; color-scheme:dark;
+}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--font);overflow:hidden}
+#wrap{display:flex;height:100%}
+#list{width:230px;flex:none;background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;font-size:12.5px;cursor:auto}
+#list h2{font-size:11px;letter-spacing:.14em;color:var(--dim);margin:12px 12px 4px;font-weight:700}
+#list .it{padding:6px 12px;cursor:pointer;display:flex;gap:8px;align-items:baseline;border-left:3px solid transparent}
+#list .it:hover{background:var(--sel)}
+#list .it.sel{background:var(--sel);border-left-color:var(--player)}
+#list .code{color:var(--dim);min-width:40px;font-size:11px}
+#list .det{margin-left:auto;font-size:10px;color:var(--ok)}
+#list .det.no{color:var(--emit)}
+#stage{flex:1;min-width:0;position:relative}
+#c{display:block;width:100%;height:100%;cursor:none;touch-action:none;user-select:none}
+#hud{position:absolute;left:14px;top:10px;pointer-events:none;font-size:14px;font-weight:700;letter-spacing:.04em;text-shadow:0 1px 2px #000;font-variant-numeric:tabular-nums;line-height:1.5}
+#hud .big{font-size:28px;line-height:1.1}
+#hud .dim{color:var(--dim);font-weight:500}
+#panel{width:270px;flex:none;background:var(--panel);border-left:1px solid var(--line);padding:14px 16px;box-sizing:border-box;overflow-y:auto;font-size:13px;cursor:auto}
+#panel h1{font-size:16px;margin:0 0 2px;letter-spacing:.06em}
+#panel .code{color:var(--dim);font-size:12px;margin-bottom:8px}
+#panel .badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--ok);color:var(--ok);margin-bottom:10px}
+#panel .badge.no{border-color:var(--emit);color:var(--emit)}
+#panel p{margin:0 0 12px;color:var(--dim);line-height:1.55}
+#panel label{display:grid;grid-template-columns:1fr auto;gap:2px 8px;margin:8px 0;align-items:center}
+#panel label span.v{color:var(--dim);font-variant-numeric:tabular-nums;min-width:52px;text-align:right}
+#panel input[type=range]{grid-column:1/3;width:100%;accent-color:var(--haz)}
+#panel .chk{display:flex;gap:8px;align-items:center;margin:10px 0}
+#panel button{width:100%;background:#182038;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;margin:4px 0;cursor:pointer}
+#panel button:hover{border-color:var(--player)}
+#panel hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+#panel #json{word-break:break-all;font-size:11px}
+@media (max-width:900px){ #wrap{flex-wrap:wrap} #list{width:50%;height:40%;order:2} #panel{width:50%;height:40%;order:3;border-left:0} #stage{width:100%;height:60%;order:1;flex:none} }
+</style>
+<div id="wrap">
+  <div id="list"></div>
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="hud">
+      <div class="big" id="hTime">0.0</div>
+      <div class="dim">生存秒 · ベスト <span id="hBest">0.0</span> · 死亡 <span id="hDeaths">0</span></div>
+      <div class="dim">速度 <span id="hSpeed">0</span> px/s · 判定 <span id="hPrims">0</span> · <span id="hFps">60</span>fps</div>
+    </div>
+  </div>
+  <div id="panel">
+    <h1 id="pName"></h1>
+    <div class="code" id="pCode"></div>
+    <div class="badge" id="pDet"></div>
+    <p id="pDesc"></p>
+    <div id="params"></div>
+    <div class="chk"><input type="checkbox" id="walls"><label for="walls" style="display:inline">比較用の壁を置く</label></div>
+    <hr>
+    <button id="reset">リセット（状態とタイマー）</button>
+    <button id="copy">ピースJSONをコピー</button>
+    <p id="json"></p>
+    <p>↑↓ キーでオブジェクト切替。死んだら1秒無敵でその場復帰。</p>
+  </div>
+</div>
+<script>
+'use strict';
+const T = { W: 1280, H: 720, HEAD_R: 4, TRAIL_LIFE: 0.6, TRAIL_GAP: 5, INVULN: 1.0 };
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const osc = (t, period, phase) => (1 - Math.cos(TAU * (t / period + (phase || 0)))) / 2;
+const frac = v => (v % 1 + 1) % 1;
+const hash = k => frac(Math.sin(k * 12.9898 + 78.233) * 43758.5453);
+// 往復反射: 値 v を [a,b] の中で折り返す
+function fold(v, a, b){ const L = b - a; if (L <= 0) return a; const u = ((v - a) % (2 * L) + 2 * L) % (2 * L); return u <= L ? a + u : b - (u - L); }
+const inRect = (x, y, r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+const rectDist = (x, y, r) => Math.hypot(Math.max(r.x - x, 0, x - (r.x + r.w)), Math.max(r.y - y, 0, y - (r.y + r.h)));
+
+// ===== 幾何（本編と同じ） =====
+function segPointDist(ax, ay, bx, by, px, py){ const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy; let u = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0; u = u < 0 ? 0 : u > 1 ? 1 : u; return Math.hypot(ax + dx * u - px, ay + dy * u - py); }
+function orient(ax, ay, bx, by, cx, cy){ return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax); }
+function segIntersect(ax, ay, bx, by, cx, cy, dx, dy){ const o1 = orient(ax, ay, bx, by, cx, cy), o2 = orient(ax, ay, bx, by, dx, dy), o3 = orient(cx, cy, dx, dy, ax, ay), o4 = orient(cx, cy, dx, dy, bx, by); return (o1 * o2 < 0) && (o3 * o4 < 0); }
+function segSegDist(ax, ay, bx, by, cx, cy, dx, dy){ if (segIntersect(ax, ay, bx, by, cx, cy, dx, dy)) return 0; return Math.min(segPointDist(ax, ay, bx, by, cx, cy), segPointDist(ax, ay, bx, by, dx, dy), segPointDist(cx, cy, dx, dy, ax, ay), segPointDist(cx, cy, dx, dy, bx, by)); }
+function segRect(x0, y0, x1, y1, xmin, ymin, xmax, ymax){ let t0 = 0, t1 = 1; const dx = x1 - x0, dy = y1 - y0, p = [-dx, dx, -dy, dy], q = [x0 - xmin, xmax - x0, y0 - ymin, ymax - y0]; for (let i = 0; i < 4; i++){ if (p[i] === 0){ if (q[i] < 0) return false; } else { const r = q[i] / p[i]; if (p[i] < 0){ if (r > t1) return false; if (r > t0) t0 = r; } else { if (r < t0) return false; if (r < t1) t1 = r; } } } return true; }
+function hit(pr, ax, ay, bx, by, r){ if (pr.on === false) return false; if (pr.k === 'rect') return segRect(ax, ay, bx, by, pr.x - r, pr.y - r, pr.x + pr.w + r, pr.y + pr.h + r); if (pr.k === 'circ') return segPointDist(ax, ay, bx, by, pr.x, pr.y) <= pr.r + r; if (pr.k === 'cap') return segSegDist(ax, ay, bx, by, pr.ax, pr.ay, pr.bx, pr.by) <= pr.r + r; return false; }
+function sweepHit(ps, ax, ay, bx, by){ for (const pr of ps) if (hit(pr, ax, ay, bx, by, T.HEAD_R)) return pr; return null; }
+
+// ===== 共通ピース =====
+function danmaku(p, t, out){
+  const kmax = Math.floor((t - (p.phase || 0) * p.interval) / p.interval), kmin = Math.max(0, Math.ceil((t - p.life - (p.phase || 0) * p.interval) / p.interval)), layers = p.layers || 1;
+  for (let k = kmin; k <= kmax; k++){ const age = t - (k + (p.phase || 0)) * p.interval; if (age < 0 || age > p.life) continue; const base = (p.aim || 0) + k * (p.spin || 0);
+    for (let i = 0; i < p.n; i++){ const ang = p.pattern === 'fan' ? base + (p.n > 1 ? -p.spread / 2 + i * p.spread / (p.n - 1) : 0) : base + i * 360 / p.n, cx = Math.cos(ang * DEG), sy = Math.sin(ang * DEG);
+      for (let L = 0; L < layers; L++){ const d = age * p.speed * (1 - L * 0.22), x = p.x + cx * d, y = p.y + sy * d; if (x < -p.r || y < -p.r || x > T.W + p.r || y > T.H + p.r) continue; out.push({ k: 'circ', x, y, r: p.r, c: 'bullet' }); } } }
+}
+function barPrims(p, t, out){ const n = p.blades || 1, base = (p.phase || 0) * TAU + t * p.rpm * TAU / 60; for (let k = 0; k < n; k++){ const a = base + k * TAU / n, cx = Math.cos(a), sy = Math.sin(a); if (p.anchor === 'end') out.push({ k: 'cap', ax: p.x, ay: p.y, bx: p.x + cx * p.len, by: p.y + sy * p.len, r: p.thick / 2, c: 'haz', hub: p }); else out.push({ k: 'cap', ax: p.x - cx * p.len / 2, ay: p.y - sy * p.len / 2, bx: p.x + cx * p.len / 2, by: p.y + sy * p.len / 2, r: p.thick / 2, c: 'haz', hub: p }); } }
+const zoneRect = p => ({ x: p.x, y: p.y, w: p.w, h: p.h });
+const WALLS = [{ t: 'wall', x: 300, y: 200, w: 40, h: 320 }, { t: 'wall', x: 940, y: 200, w: 40, h: 320 }, { t: 'wall', x: 560, y: 90, w: 160, h: 36 }, { t: 'wall', x: 560, y: 594, w: 160, h: 36 }];
+const SAMPLE_ORBITS = [{ t: 'orbit', x: 500, y: 360, R: 90, r: 16, rpm: 40 }, { t: 'orbit', x: 780, y: 360, R: 90, r: 16, rpm: -40, phase: 0.5 }];
+function orbitPrims(p, t, out){ const a = (p.phase || 0) * TAU + t * p.rpm * TAU / 60; out.push({ k: 'circ', x: p.x + Math.cos(a) * p.R, y: p.y + Math.sin(a) * p.R, r: p.r, c: 'haz' }); }
+
+// ===== 図鑑 =====
+// 各項目: code, cat, name, det(時間の純関数=マルチ同期可), desc, make()→ピース配列(先頭がパラメータ対象), params, prims(p,t,env,out), update(p,env,dt), check(p,env)→死, draw(p,t,env,layer)
+const P = (k, l, min, max, step) => ({ k, l, min, max, step: step || 1 });
+const CATALOG = [
+// ---------- 弾幕 ----------
+{ code: 'DM-1', cat: '弾幕', name: 'リング弾幕', det: true, walls: true, desc: '全方向に等間隔で弾を放つ。毎発ずつ回転させると隙間が流れる。弾は壁を貫通。',
+  make: () => [{ t: 'danmaku', x: 640, y: 360, pattern: 'ring', n: 24, speed: 160, interval: 0.7, r: 6, spin: 7, spread: 60, layers: 1, life: 5 }],
+  params: [P('n', '弾数/発', 1, 48), P('speed', '弾速', 40, 600, 10), P('interval', '間隔 s', 0.03, 2, 0.01), P('r', '半径', 2, 16), P('spin', '毎発の回転°', -30, 30, 0.5), P('layers', '多層', 1, 5)], prims: (p, t, e, o) => danmaku(p, t, o) },
+{ code: 'DM-2', cat: '弾幕', name: '扇の掃射', det: true, walls: true, desc: '狭い扇状に撃ちながら砲塔が回る。弾の列が壁のように押し寄せる。',
+  make: () => [{ t: 'danmaku', x: 640, y: 360, pattern: 'fan', n: 7, speed: 260, interval: 0.25, r: 6, spin: 9, spread: 60, layers: 1, life: 4 }],
+  params: [P('n', '弾数/発', 1, 30), P('spread', '扇の広がり°', 5, 180, 5), P('speed', '弾速', 40, 600, 10), P('interval', '間隔 s', 0.03, 2, 0.01), P('spin', '毎発の回転°', -30, 30, 0.5)], prims: (p, t, e, o) => danmaku(p, t, o) },
+{ code: 'DM-3', cat: '弾幕', name: '渦巻き', det: true, walls: true, desc: '少数の腕を高速で回しながら連射。腕の間を縫って進む。',
+  make: () => [{ t: 'danmaku', x: 640, y: 360, pattern: 'ring', n: 3, speed: 180, interval: 0.06, r: 5, spin: 11, spread: 60, layers: 1, life: 5 }],
+  params: [P('n', '腕の数', 1, 8), P('speed', '弾速', 40, 600, 10), P('interval', '間隔 s', 0.03, 0.5, 0.01), P('spin', '毎発の回転°', -30, 30, 0.5), P('r', '半径', 2, 16)], prims: (p, t, e, o) => danmaku(p, t, o) },
+{ code: 'DM-4', cat: '弾幕', name: '狙い撃ち', det: false, walls: true, desc: '発射時のカーソル位置を狙って撃つ。止まっていると当たる。マルチでは各自の画面で判定。',
+  make: () => [{ t: 'aimed', x: 640, y: 110, n: 3, spread: 30, speed: 320, interval: 0.8, r: 6, life: 4 }],
+  params: [P('n', '弾数/発', 1, 9), P('spread', '広がり°', 0, 120, 5), P('speed', '弾速', 60, 800, 10), P('interval', '間隔 s', 0.1, 3, 0.05)],
+  update(p, e, dt){ const s = p._s || (p._s = { b: [], next: 0 }); if (e.t >= s.next){ s.next = e.t + p.interval; if (e.have){ const a = Math.atan2(e.cur.y - p.y, e.cur.x - p.x); for (let i = 0; i < p.n; i++){ const ang = a + (p.n > 1 ? (-p.spread / 2 + i * p.spread / (p.n - 1)) * DEG : 0); s.b.push({ x: p.x, y: p.y, vx: Math.cos(ang) * p.speed, vy: Math.sin(ang) * p.speed, t0: e.t }); } } }
+    for (const b of s.b){ b.x += b.vx * dt; b.y += b.vy * dt; } s.b = s.b.filter(b => e.t - b.t0 < p.life && b.x > -20 && b.y > -20 && b.x < T.W + 20 && b.y < T.H + 20); },
+  prims(p, t, e, o){ for (const b of (p._s ? p._s.b : [])) o.push({ k: 'circ', x: b.x, y: b.y, r: p.r, c: 'bullet' }); },
+  draw(p, t, e, L){ if (L !== 'over') return; emitter(p.x, p.y, e.have ? Math.atan2(e.cur.y - p.y, e.cur.x - p.x) : 0, true); } },
+{ code: 'DM-5', cat: '弾幕', name: '反射弾', det: true, walls: true, desc: '画面端で跳ね返る弾。寿命が長いので画面に溜まっていく。壁は貫通、端だけ反射。',
+  make: () => [{ t: 'bounce', x: 640, y: 360, n: 10, speed: 220, interval: 1.4, r: 7, life: 6, spin: 15 }],
+  params: [P('n', '弾数/発', 1, 24), P('speed', '弾速', 40, 600, 10), P('interval', '間隔 s', 0.2, 4, 0.1), P('life', '寿命 s', 1, 12, 0.5), P('r', '半径', 2, 16)],
+  prims(p, t, e, o){ const kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - p.life) / p.interval)); for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0 || age > p.life) continue; for (let i = 0; i < p.n; i++){ const ang = (k * p.spin + i * 360 / p.n) * DEG; o.push({ k: 'circ', x: fold(p.x + Math.cos(ang) * p.speed * age, p.r, T.W - p.r), y: fold(p.y + Math.sin(ang) * p.speed * age, p.r, T.H - p.r), r: p.r, c: 'bullet' }); } } },
+  draw(p, t, e, L){ if (L === 'over') emitter(p.x, p.y, 0, false); } },
+{ code: 'DM-6', cat: '弾幕', name: '回転レーザー', det: true, walls: true, desc: '中心から伸びる長いレーザーがゆっくり回る。予告線のあと発射。',
+  make: () => [{ t: 'rotlaser', x: 640, y: 360, len: 900, rpm: 6, thick: 10, on: 2, warn: 0.7, off: 1.3 }],
+  params: [P('rpm', '回転 rpm', -30, 30, 0.5), P('thick', '太さ', 4, 30), P('on', '照射 s', 0.3, 5, 0.1), P('warn', '予告 s', 0, 2, 0.1), P('off', '休み s', 0, 5, 0.1)],
+  state(p, t){ const cyc = p.on + p.warn + p.off, ph = frac(t / cyc) * cyc, a = t * p.rpm * TAU / 60; return { a, warn: ph < p.warn, on: ph >= p.warn && ph < p.warn + p.on }; },
+  prims(p, t, e, o){ const s = this.state(p, t); if (s.on) o.push({ k: 'cap', ax: p.x, ay: p.y, bx: p.x + Math.cos(s.a) * p.len, by: p.y + Math.sin(s.a) * p.len, r: p.thick / 2, c: 'laser' }); },
+  draw(p, t, e, L){ if (L !== 'over') return; const s = this.state(p, t); if (s.warn){ ctx.save(); ctx.strokeStyle = C.laser; ctx.globalAlpha = 0.35 + 0.35 * Math.sin(t * 30); ctx.lineWidth = 2; ctx.setLineDash([8, 8]); ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + Math.cos(s.a) * p.len, p.y + Math.sin(s.a) * p.len); ctx.stroke(); ctx.restore(); } emitter(p.x, p.y, s.a, true); } },
+{ code: 'DM-7', cat: '弾幕', name: '雨', det: true, walls: true, desc: '上から疑似乱数の位置に弾が降る。乱数は番号から決まるので全員同じ雨。',
+  make: () => [{ t: 'rain', x: 0, w: 1280, interval: 0.12, speed: 300, r: 6, seed: 1 }],
+  params: [P('interval', '間隔 s', 0.03, 1, 0.01), P('speed', '落下速度', 60, 900, 10), P('r', '半径', 2, 16), P('seed', 'seed', 1, 99)],
+  prims(p, t, e, o){ const life = (T.H + 2 * p.r) / p.speed, kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - life) / p.interval)); for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0) continue; const y = -p.r + p.speed * age; if (y > T.H + p.r) continue; o.push({ k: 'circ', x: p.x + hash(k * 7 + p.seed * 131) * p.w, y, r: p.r, c: 'bullet' }); } } },
+{ code: 'DM-8', cat: '弾幕', name: '炸裂弾', det: true, walls: true, desc: '遅い親弾が一定時間後に弾けて子弾のリングになる。弾ける場所を読む遊び。',
+  make: () => [{ t: 'burst', x: 640, y: 360, aim: 0, spin: 47, interval: 1.0, speed: 150, fuse: 1.2, m: 12, speed2: 180, life2: 2.5, r: 9, r2: 5 }],
+  params: [P('interval', '間隔 s', 0.2, 3, 0.1), P('speed', '親弾速', 40, 400, 10), P('fuse', '炸裂まで s', 0.2, 4, 0.1), P('m', '子弾数', 3, 36), P('speed2', '子弾速', 40, 500, 10), P('spin', '毎発の回転°', 0, 180, 1)],
+  prims(p, t, e, o){ const total = p.fuse + p.life2, kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - total) / p.interval)); for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0 || age > total) continue; const a = (p.aim + k * p.spin) * DEG, cx = Math.cos(a), sy = Math.sin(a);
+      if (age < p.fuse) o.push({ k: 'circ', x: p.x + cx * p.speed * age, y: p.y + sy * p.speed * age, r: p.r, c: 'bullet' });
+      else { const bx = p.x + cx * p.speed * p.fuse, by = p.y + sy * p.speed * p.fuse, a2 = age - p.fuse; for (let i = 0; i < p.m; i++){ const b = (i * 360 / p.m + k * 10) * DEG; o.push({ k: 'circ', x: bx + Math.cos(b) * p.speed2 * a2, y: by + Math.sin(b) * p.speed2 * a2, r: p.r2, c: 'bullet' }); } } } },
+  draw(p, t, e, L){ if (L === 'over') emitter(p.x, p.y, 0, false); } },
+// ---------- 移動物 ----------
+{ code: 'MV-1', cat: '移動物', name: '往復レーザー', det: true, desc: '縦のレーザー線が左右に往復する。タイミングで抜ける。',
+  make: () => [{ t: 'slidelaser', x: 640, y: 360, len: 320, dx: 500, period: 3, thick: 8 }],
+  params: [P('len', '長さ', 60, 700, 10), P('dx', '移動幅', 50, 1000, 10), P('period', '周期 s', 0.5, 8, 0.1), P('thick', '太さ', 2, 24)],
+  prims(p, t, e, o){ const cx = p.x - p.dx / 2 + p.dx * osc(t, p.period); o.push({ k: 'cap', ax: cx, ay: p.y - p.len / 2, bx: cx, by: p.y + p.len / 2, r: p.thick / 2, c: 'laser' }); } },
+{ code: 'MV-2', cat: '移動物', name: '押し潰し壁', det: true, desc: '上下から壁が閉じて開く。閉じ切る前に通る。',
+  make: () => [{ t: 'crusher', x: 540, w: 200, gap: 60, travel: 260, period: 2.2 }],
+  params: [P('w', '幅', 40, 600, 10), P('gap', '最小の隙間', 0, 300, 5), P('travel', '移動量', 20, 330, 10), P('period', '周期 s', 0.5, 6, 0.1)],
+  prims(p, t, e, o){ const h = T.H / 2 - p.gap / 2 - p.travel * (1 - osc(t, p.period)); o.push({ k: 'rect', x: p.x, y: 0, w: p.w, h, c: 'haz' }, { k: 'rect', x: p.x, y: T.H - h, w: p.w, h, c: 'haz' }); } },
+{ code: 'MV-3', cat: '移動物', name: '十字スピナー', det: true, desc: '4枚羽根の回転。羽根の数と回転速度で密度が変わる。',
+  make: () => [{ t: 'bar', x: 640, y: 360, len: 420, thick: 14, rpm: 15, blades: 4 }],
+  params: [P('blades', '羽根', 1, 8), P('len', '長さ', 100, 900, 10), P('rpm', '回転 rpm', -60, 60), P('thick', '太さ', 4, 30)], prims: (p, t, e, o) => barPrims(p, t, o) },
+{ code: 'MV-4', cat: '移動物', name: '巡回ブロック', det: true, desc: '決めた経路を一定速度で巡回する。経路は設置時に点列で指定する想定。',
+  make: () => [{ t: 'patrol', pts: [[200, 200], [1080, 200], [1080, 520], [200, 520]], speed: 320, w: 60, h: 60 }],
+  params: [P('speed', '速度', 40, 900, 10), P('w', '幅', 20, 200, 5), P('h', '高さ', 20, 200, 5)],
+  pos(p, t){ const pts = p.pts, n = pts.length; let L = 0; const seg = []; for (let i = 0; i < n; i++){ const a = pts[i], b = pts[(i + 1) % n], l = Math.hypot(b[0] - a[0], b[1] - a[1]); seg.push(l); L += l; } let d = (t * p.speed) % L; for (let i = 0; i < n; i++){ if (d <= seg[i]){ const a = pts[i], b = pts[(i + 1) % n], u = d / seg[i]; return { x: a[0] + (b[0] - a[0]) * u, y: a[1] + (b[1] - a[1]) * u }; } d -= seg[i]; } return { x: pts[0][0], y: pts[0][1] }; },
+  prims(p, t, e, o){ const c = this.pos(p, t); o.push({ k: 'rect', x: c.x - p.w / 2, y: c.y - p.h / 2, w: p.w, h: p.h, c: 'haz' }); },
+  draw(p, t, e, L){ if (L !== 'under') return; ctx.save(); ctx.strokeStyle = C.haz; ctx.globalAlpha = 0.18; ctx.setLineDash([6, 8]); ctx.beginPath(); p.pts.forEach((q, i) => i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1])); ctx.closePath(); ctx.stroke(); ctx.restore(); } },
+{ code: 'MV-5', cat: '移動物', name: '伸縮バー', det: true, desc: '回転しながら長さが伸び縮みする。短いときに外側を抜ける。',
+  make: () => [{ t: 'stretch', x: 640, y: 360, lmin: 100, lmax: 640, period: 2.5, rpm: 10, thick: 14 }],
+  params: [P('lmin', '最短', 20, 400, 10), P('lmax', '最長', 100, 1000, 10), P('period', '伸縮周期 s', 0.5, 6, 0.1), P('rpm', '回転 rpm', -40, 40)],
+  prims(p, t, e, o){ barPrims({ ...p, len: p.lmin + (p.lmax - p.lmin) * osc(t, p.period) }, t, o); } },
+{ code: 'MV-6', cat: '移動物', name: '呼吸ブロック', det: true, desc: '中心固定で大きさが脈動する四角。脈動円の四角版。',
+  make: () => [{ t: 'breathe', x: 640, y: 360, w: 320, h: 320, period: 2, min: 0.2 }],
+  params: [P('w', '最大幅', 40, 700, 10), P('h', '最大高', 40, 700, 10), P('period', '周期 s', 0.3, 6, 0.1), P('min', '最小倍率', 0, 1, 0.05)],
+  prims(p, t, e, o){ const s = p.min + (1 - p.min) * osc(t, p.period), w = p.w * s, h = p.h * s; o.push({ k: 'rect', x: p.x - w / 2, y: p.y - h / 2, w, h, c: 'haz' }); } },
+{ code: 'MV-7', cat: '移動物', name: '跳ねるボール', det: true, desc: '画面端で反射して斜めに飛び続ける。位置は時刻から直接計算できる。',
+  make: () => [{ t: 'ball', x: 300, y: 200, vx: 260, vy: 190, r: 30 }],
+  params: [P('vx', '横速度', -600, 600, 10), P('vy', '縦速度', -600, 600, 10), P('r', '半径', 6, 120)],
+  prims(p, t, e, o){ o.push({ k: 'circ', x: fold(p.x + p.vx * t, p.r, T.W - p.r), y: fold(p.y + p.vy * t, p.r, T.H - p.r), r: p.r, c: 'haz' }); } },
+{ code: 'MV-8', cat: '移動物', name: '列車', det: true, desc: '円軌道を連結ブロックが走る。車両の間隔を縫う。',
+  make: () => [{ t: 'train', x: 640, y: 360, R: 240, cars: 6, size: 44, rpm: 20, spacing: 14 }],
+  params: [P('R', '軌道半径', 60, 340, 10), P('cars', '車両数', 1, 20), P('size', '車両サイズ', 10, 120, 2), P('rpm', '速度 rpm', -60, 60), P('spacing', '車両間隔°', 4, 60)],
+  prims(p, t, e, o){ for (let i = 0; i < p.cars; i++){ const a = t * p.rpm * TAU / 60 + i * p.spacing * DEG; o.push({ k: 'rect', x: p.x + Math.cos(a) * p.R - p.size / 2, y: p.y + Math.sin(a) * p.R - p.size / 2, w: p.size, h: p.size, c: 'haz' }); } },
+  draw(p, t, e, L){ if (L !== 'under') return; ctx.save(); ctx.strokeStyle = C.haz; ctx.globalAlpha = 0.18; ctx.setLineDash([6, 8]); ctx.beginPath(); ctx.arc(p.x, p.y, p.R, 0, TAU); ctx.stroke(); ctx.restore(); } },
+{ code: 'MV-9', cat: '移動物', name: '蛇', det: true, desc: '波打ちながら横切る連結体。胴体の間は通れない、頭と尾の外を回る。',
+  make: () => [{ t: 'serpent', y: 360, amp: 140, wave: 400, speed: 260, segs: 14, gap: 22, r: 14 }],
+  params: [P('amp', '振幅', 0, 320, 10), P('wave', '波長', 100, 1200, 10), P('speed', '速度', 40, 800, 10), P('segs', '節数', 2, 40), P('gap', '節間隔', 6, 60), P('r', '太さ', 4, 40)],
+  prims(p, t, e, o){ const span = T.W + 400; for (let i = 0; i < p.segs; i++){ const x = ((p.speed * t - i * p.gap) % span + span) % span - 200; o.push({ k: 'circ', x, y: p.y + p.amp * Math.sin(TAU * x / p.wave), r: p.r, c: 'haz' }); } } },
+// ---------- トラップ ----------
+{ code: 'TR-1', cat: 'トラップ', name: '地雷', det: false, desc: '近づくと起爆して少し後に爆発する。踏まずに離れれば不発。各自の画面で判定。',
+  make: () => [{ t: 'mines', pts: [[320, 220], [640, 180], [960, 220], [400, 520], [640, 600], [880, 520], [640, 380]], trigger: 70, fuse: 0.5, blast: 90, hold: 0.3, cooldown: 2 }],
+  params: [P('trigger', '起爆距離', 20, 200, 5), P('fuse', '導火 s', 0.1, 2, 0.05), P('blast', '爆風半径', 20, 250, 5), P('hold', '爆風持続 s', 0.05, 1, 0.05)],
+  update(p, e, dt){ const s = p._s || (p._s = p.pts.map(() => ({ ph: 'idle', t0: 0 }))); p.pts.forEach((q, i) => { const m = s[i], d = e.have ? Math.hypot(e.cur.x - q[0], e.cur.y - q[1]) : 1e9; if (m.ph === 'idle' && d < p.trigger){ m.ph = 'armed'; m.t0 = e.t; } else if (m.ph === 'armed' && e.t - m.t0 >= p.fuse){ m.ph = 'blast'; m.t0 = e.t; } else if (m.ph === 'blast' && e.t - m.t0 >= p.hold){ m.ph = 'cool'; m.t0 = e.t; } else if (m.ph === 'cool' && e.t - m.t0 >= p.cooldown) m.ph = 'idle'; }); },
+  prims(p, t, e, o){ const s = p._s || []; p.pts.forEach((q, i) => { if (s[i] && s[i].ph === 'blast') o.push({ k: 'circ', x: q[0], y: q[1], r: p.blast, c: 'haz' }); }); },
+  draw(p, t, e, L){ if (L !== 'over') return; const s = p._s || []; p.pts.forEach((q, i) => { const m = s[i] || { ph: 'idle' }; ctx.save(); ctx.beginPath(); ctx.arc(q[0], q[1], 10, 0, TAU); ctx.fillStyle = m.ph === 'cool' ? '#3a2a30' : '#5a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.globalAlpha = m.ph === 'cool' ? 0.3 : 1; ctx.stroke();
+      ctx.globalAlpha = 0.15; ctx.setLineDash([3, 5]); ctx.beginPath(); ctx.arc(q[0], q[1], p.trigger, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
+      if (m.ph === 'armed'){ ctx.globalAlpha = 0.4 + 0.4 * Math.sin(t * 40); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q[0], q[1], p.blast, 0, TAU); ctx.stroke(); } ctx.restore(); }); } },
+{ code: 'TR-2', cat: 'トラップ', name: '予告付き床', det: true, desc: '周期的に即死床になる。発動前に縁が点滅するので、見てから退く。',
+  make: () => [{ t: 'warnfloor', x: 440, y: 260, w: 400, h: 200, period: 3, duty: 0.3, warn: 0.6 }],
+  params: [P('w', '幅', 60, 1000, 10), P('h', '高さ', 60, 600, 10), P('period', '周期 s', 1, 8, 0.1), P('duty', '発動割合', 0.05, 0.9, 0.05), P('warn', '予告 s', 0, 2, 0.1)],
+  prims(p, t, e, o){ o.push({ k: 'rect', x: p.x, y: p.y, w: p.w, h: p.h, c: 'haz', on: frac(t / p.period) < p.duty }); },
+  draw(p, t, e, L){ if (L !== 'under') return; const ph = frac(t / p.period), warn = ph > 1 - p.warn / p.period; ctx.save(); ctx.strokeStyle = C.haz; ctx.lineWidth = warn ? 4 : 2; ctx.globalAlpha = warn ? 0.4 + 0.5 * Math.abs(Math.sin(t * 25)) : 0.25; ctx.setLineDash(warn ? [] : [6, 6]); ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.restore(); } },
+{ code: 'TR-3', cat: 'トラップ', name: 'レーザー順送り', det: true, desc: '並んだレーザーが端から順に発射する。リズムに合わせて進む。',
+  make: () => [{ t: 'seq', x: 340, y: 160, w: 600, h: 400, lines: 5, slot: 0.4, on: 0.25, thick: 8 }],
+  params: [P('lines', '本数', 2, 12), P('slot', '1本の持ち時間 s', 0.1, 2, 0.05), P('on', '照射 s', 0.05, 2, 0.05), P('w', '幅', 100, 1100, 10)],
+  prims(p, t, e, o){ const cyc = p.lines * p.slot, act = Math.floor(frac(t / cyc) * p.lines), on = (t % p.slot) < p.on; for (let i = 0; i < p.lines; i++){ const x = p.x + (p.lines > 1 ? i * p.w / (p.lines - 1) : 0); o.push({ k: 'cap', ax: x, ay: p.y, bx: x, by: p.y + p.h, r: p.thick / 2, c: 'laser', on: i === act && on }); } } },
+{ code: 'TR-4', cat: 'トラップ', name: '追跡者', det: false, desc: '一定速度でカーソルに向かって来る。手より遅いが止まると追いつかれる。各自の画面で判定。',
+  make: () => [{ t: 'chaser', x: 640, y: 360, speed: 180, r: 18 }],
+  params: [P('speed', '速度', 40, 600, 10), P('r', '半径', 6, 60)],
+  update(p, e, dt){ const s = p._s || (p._s = { x: p.x, y: p.y }); if (!e.have) return; const dx = e.cur.x - s.x, dy = e.cur.y - s.y, d = Math.hypot(dx, dy); if (d > 1){ const m = Math.min(d, p.speed * dt); s.x += dx / d * m; s.y += dy / d * m; } },
+  prims(p, t, e, o){ const s = p._s || p; o.push({ k: 'circ', x: s.x, y: s.y, r: p.r, c: 'haz' }); },
+  draw(p, t, e, L){ if (L !== 'over') return; const s = p._s || p; ctx.beginPath(); ctx.arc(s.x, s.y, p.r * 0.4, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill(); ctx.beginPath(); ctx.arc(s.x + p.r * 0.15, s.y, p.r * 0.18, 0, TAU); ctx.fillStyle = '#111'; ctx.fill(); } },
+{ code: 'TR-5', cat: 'トラップ', name: '自分の影', det: false, desc: '数秒前の自分の軌跡をなぞる影が追ってくる。同じ場所に留まれない。各自の画面で判定。',
+  make: () => [{ t: 'shadow', delay: 1.5, r: 10 }],
+  params: [P('delay', '遅れ s', 0.3, 5, 0.1), P('r', '半径', 4, 30)],
+  at(e, dt){ const h = e.history, tt = e.t - dt; if (!h.length || h[0].t > tt) return null; let i = h.length - 1; while (i > 0 && h[i].t > tt) i--; return h[i]; },
+  prims(p, t, e, o){ const q = this.at(e, p.delay); if (q) o.push({ k: 'circ', x: q.x, y: q.y, r: p.r, c: 'haz' }); },
+  draw(p, t, e, L){ if (L !== 'over') return; const h = e.history; ctx.save(); ctx.fillStyle = C.haz; for (const q of h){ const a = (e.t - q.t); if (a < p.delay || a > p.delay + 0.6) continue; ctx.globalAlpha = 0.5 * (1 - (a - p.delay) / 0.6); ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, TAU); ctx.fill(); } ctx.restore(); } },
+{ code: 'TR-6', cat: 'トラップ', name: '偽装壁', det: true, desc: '本物の壁そっくりだが触れても死なない。右は本物。見分けがつくかの確認用。',
+  make: () => [{ t: 'fakewall', x: 500, y: 200, w: 80, h: 320 }, { t: 'wall', x: 700, y: 200, w: 80, h: 320 }],
+  params: [P('w', '幅', 20, 300, 5), P('h', '高さ', 40, 700, 10)],
+  prims(){}, draw(p, t, e, L){ if (L !== 'under') return; ctx.fillStyle = '#2b3650'; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.strokeStyle = '#5a6d94'; ctx.lineWidth = 2; ctx.setLineDash([5, 3]); ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2); ctx.setLineDash([]); } },
+{ code: 'TR-7', cat: 'トラップ', name: '透明壁', det: true, desc: '近づいたときだけうっすら見える壁。判定は常にある。',
+  make: () => [{ t: 'ghostwall', x: 600, y: 200, w: 80, h: 320, reveal: 160 }],
+  params: [P('w', '幅', 20, 300, 5), P('h', '高さ', 40, 700, 10), P('reveal', '見える距離', 0, 400, 10)],
+  prims(p, t, e, o){ o.push({ k: 'rect', x: p.x, y: p.y, w: p.w, h: p.h, c: 'hidden' }); },
+  draw(p, t, e, L){ if (L !== 'under') return; const d = e.have ? rectDist(e.cur.x, e.cur.y, p) : 1e9, a = Math.max(0, 1 - d / Math.max(1, p.reveal)); ctx.save(); ctx.globalAlpha = 0.05 + 0.8 * a; ctx.fillStyle = '#2b3650'; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.strokeStyle = '#5a6d94'; ctx.lineWidth = 2; ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2); ctx.restore(); } },
+// ---------- フィールド効果 ----------
+{ code: 'FX-1', cat: 'フィールド', name: '暗闇', det: true, desc: 'カーソルの周りしか見えない。障害物は見本の周回を置いてある。',
+  make: () => [{ t: 'dark', radius: 150 }, ...SAMPLE_ORBITS],
+  params: [P('radius', '視界半径', 40, 500, 10)],
+  prims(){}, draw(p, t, e, L){ if (L !== 'top') return; const cx = e.have ? e.cur.x : -999, cy = e.have ? e.cur.y : -999; const g = ctx.createRadialGradient(cx, cy, p.radius * 0.55, cx, cy, p.radius); g.addColorStop(0, 'rgba(5,7,12,0)'); g.addColorStop(1, 'rgba(5,7,12,0.97)'); ctx.fillStyle = g; ctx.fillRect(0, 0, T.W, T.H); } },
+{ code: 'FX-2', cat: 'フィールド', name: '霧の区画', det: true, desc: '区画の中は霧で見えず、近づいた分だけ見える。中に見本の周回を置いてある。',
+  make: () => [{ t: 'fog', x: 380, y: 140, w: 520, h: 440, reveal: 120 }, ...SAMPLE_ORBITS],
+  params: [P('w', '幅', 100, 1200, 10), P('h', '高さ', 100, 700, 10), P('reveal', '見える半径', 20, 400, 10)],
+  prims(){}, draw(p, t, e, L){ if (L !== 'top') return; ctx.save(); ctx.beginPath(); ctx.rect(p.x, p.y, p.w, p.h); if (e.have) ctx.arc(e.cur.x, e.cur.y, p.reveal, 0, TAU, true); ctx.fillStyle = 'rgba(28,36,56,0.96)'; ctx.fill('evenodd'); ctx.strokeStyle = C.zone; ctx.globalAlpha = 0.4; ctx.lineWidth = 2; ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.restore(); } },
+{ code: 'FX-3', cat: 'フィールド', name: '一方通行', det: true, desc: '矢印の向きにしか越えられない線。逆方向に跨ぐと死ぬ。戻れないコースが作れる。',
+  make: () => [{ t: 'oneway', ax: 640, ay: 120, bx: 640, by: 600, dir: 1 }],
+  params: [P('dir', '向き(1/-1)', -1, 1, 2)],
+  prims(){}, check(p, e){ if (!e.have || !e.prev) return false; const o1 = orient(p.ax, p.ay, p.bx, p.by, e.prev.x, e.prev.y), o2 = orient(p.ax, p.ay, p.bx, p.by, e.cur.x, e.cur.y); if (!segIntersect(p.ax, p.ay, p.bx, p.by, e.prev.x, e.prev.y, e.cur.x, e.cur.y)) return false; return (o1 < 0 && o2 > 0) ? p.dir < 0 : p.dir > 0; },
+  draw(p, t, e, L){ if (L !== 'under') return; const nx = -(p.by - p.ay), ny = p.bx - p.ax, n = Math.hypot(nx, ny), ux = nx / n * p.dir, uy = ny / n * p.dir; ctx.save(); ctx.strokeStyle = C.zone; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(p.ax, p.ay); ctx.lineTo(p.bx, p.by); ctx.stroke(); ctx.fillStyle = C.zone; for (let u = 0.15; u < 1; u += 0.2){ const x = p.ax + (p.bx - p.ax) * u, y = p.ay + (p.by - p.ay) * u, s = 14 + 4 * Math.sin(t * 6); ctx.beginPath(); ctx.moveTo(x + ux * s, y + uy * s); ctx.lineTo(x - uy * 8, y + ux * 8); ctx.lineTo(x + uy * 8, y - ux * 8); ctx.closePath(); ctx.fill(); } ctx.restore(); } },
+{ code: 'FX-4', cat: 'フィールド', name: '速度制限区画', det: false, desc: '区画内で制限速度を超えると死ぬ。ゆっくり丁寧に通る場所を作る。速度は各自の手なので各自判定。',
+  make: () => [{ t: 'speedzone', x: 340, y: 160, w: 600, h: 400, limit: 400 }],
+  params: [P('limit', '制限 px/s', 50, 1500, 10), P('w', '幅', 100, 1100, 10), P('h', '高さ', 100, 700, 10)],
+  prims(){}, check(p, e){ return e.have && inRect(e.cur.x, e.cur.y, p) && e.speed > p.limit; },
+  draw(p, t, e, L){ if (L !== 'under') return; const inside = e.have && inRect(e.cur.x, e.cur.y, p), over = inside && e.speed > p.limit * 0.8; zone(p, over ? C.haz : C.zone, `≤ ${p.limit} px/s`); if (inside) text(Math.round(e.speed) + '', e.cur.x, e.cur.y - 22, 13, over ? C.haz : C.zone, 'center'); } },
+{ code: 'FX-5', cat: 'フィールド', name: '停止禁止区画', det: false, desc: '区画内で一定速度を下回ったまま猶予を過ぎると死ぬ。止まって様子見ができない。各自判定。',
+  make: () => [{ t: 'nostop', x: 340, y: 160, w: 600, h: 400, min: 150, grace: 0.5 }],
+  params: [P('min', '最低速度 px/s', 20, 800, 10), P('grace', '猶予 s', 0.1, 3, 0.1), P('w', '幅', 100, 1100, 10), P('h', '高さ', 100, 700, 10)],
+  prims(){}, update(p, e, dt){ const s = p._s || (p._s = { acc: 0 }); s.acc = (e.have && inRect(e.cur.x, e.cur.y, p) && e.speed < p.min) ? s.acc + dt : 0; }, check(p, e){ return p._s && p._s.acc > p.grace; },
+  draw(p, t, e, L){ if (L !== 'under') return; const s = p._s || { acc: 0 }, f = Math.min(1, s.acc / p.grace); zone(p, f > 0 ? C.haz : C.zone, `≥ ${p.min} px/s`); if (f > 0 && e.have){ ctx.fillStyle = C.haz; ctx.fillRect(e.cur.x - 20, e.cur.y - 26, 40 * f, 5); ctx.strokeStyle = C.haz; ctx.lineWidth = 1; ctx.strokeRect(e.cur.x - 20, e.cur.y - 26, 40, 5); } } },
+{ code: 'FX-6', cat: 'フィールド', name: '鍵と扉', det: false, desc: '鍵パッドに触れると扉の壁が開く。見本では数秒で閉じ直す。マルチなら「誰かが開けたら全員開く」が自然。',
+  make: () => [{ t: 'keydoor', kx: 200, ky: 360, dx: 640, dy: 100, dw: 40, dh: 520, reclose: 4 }],
+  params: [P('reclose', '再閉鎖 s', 1, 15, 0.5), P('dw', '扉の幅', 10, 200, 5), P('dh', '扉の高さ', 50, 720, 10)],
+  update(p, e, dt){ const s = p._s || (p._s = { open: false, t0: 0 }); if (!s.open && e.have && Math.hypot(e.cur.x - p.kx, e.cur.y - p.ky) < 28){ s.open = true; s.t0 = e.t; } if (s.open && e.t - s.t0 > p.reclose) s.open = false; },
+  prims(p, t, e, o){ if (!(p._s && p._s.open)) o.push({ k: 'rect', x: p.dx, y: p.dy, w: p.dw, h: p.dh, c: 'wall' }); },
+  draw(p, t, e, L){ if (L !== 'over') return; const open = p._s && p._s.open; ctx.save(); ctx.beginPath(); ctx.arc(p.kx, p.ky, 28, 0, TAU); ctx.fillStyle = open ? '#2a3a2a' : '#3a3420'; ctx.fill(); ctx.strokeStyle = open ? C.ok : C.emit; ctx.lineWidth = 3; ctx.stroke(); text(open ? 'OPEN' : 'KEY', p.kx, p.ky, 12, open ? C.ok : C.emit, 'center');
+    if (open){ ctx.globalAlpha = 0.25; ctx.setLineDash([6, 6]); ctx.strokeStyle = C.ok; ctx.lineWidth = 2; ctx.strokeRect(p.dx, p.dy, p.dw, p.dh); } ctx.restore(); } },
+];
+
+// ===== 描画ヘルパー =====
+const C = { haz: '#ff3b5c', bullet: '#ff5c7a', laser: '#ff4fd8', zone: '#4fd3ff', emit: '#ffb84d', ok: '#49e07c', player: '#5ee1ff', dim: '#7d8aa3', fg: '#e6ecf5' };
+const cvs = document.getElementById('c'), ctx = cvs.getContext('2d'), stage = document.getElementById('stage');
+function emitter(x, y, a, aimed){ ctx.save(); ctx.translate(x, y); ctx.rotate(a); ctx.beginPath(); ctx.arc(0, 0, 16, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.emit; ctx.lineWidth = 3; ctx.stroke(); if (aimed){ ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(26, 0); ctx.stroke(); } ctx.restore(); }
+function text(str, x, y, size, color, align){ ctx.fillStyle = color; ctx.font = `700 ${size}px ui-monospace,Consolas,monospace`; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle'; ctx.fillText(str, x, y); }
+function zone(p, color, label){ ctx.save(); ctx.fillStyle = color; ctx.globalAlpha = 0.08; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.globalAlpha = 0.6; ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([8, 6]); ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.globalAlpha = 1; ctx.setLineDash([]); text(label, p.x + 10, p.y + 14, 13, color); ctx.restore(); }
+
+// ===== UI =====
+const $ = id => document.getElementById(id);
+let sel = 0, pieces = [], main = null;
+function buildList(){
+  const list = $('list'); list.innerHTML = ''; let cat = null;
+  CATALOG.forEach((o, i) => { if (o.cat !== cat){ cat = o.cat; const h = document.createElement('h2'); h.textContent = cat; list.appendChild(h); }
+    const d = document.createElement('div'); d.className = 'it' + (i === sel ? ' sel' : ''); d.dataset.i = i;
+    d.innerHTML = `<span class="code">${o.code}</span><span>${o.name}</span><span class="det${o.det ? '' : ' no'}">${o.det ? '同期' : '各自'}</span>`;
+    d.addEventListener('click', () => select(i)); list.appendChild(d); });
+}
+function select(i){
+  sel = i; const o = CATALOG[i]; pieces = o.make().map(p => ({ ...p })); main = pieces[0]; main._o = o;
+  // 副ピース（見本の壁や周回）の描画・判定は共通処理
+  for (const p of pieces.slice(1)) p._o = p.t === 'wall' ? WALL_O : p.t === 'orbit' ? ORBIT_O : null;
+  $('walls').checked = !!o.walls; resetRun();
+  $('pName').textContent = o.name; $('pCode').textContent = o.code + ' · ' + o.cat; $('pDet').textContent = o.det ? '時間の純関数：マルチ同期OK' : 'カーソル依存：各自の画面で判定'; $('pDet').className = 'badge' + (o.det ? '' : ' no'); $('pDesc').textContent = o.desc;
+  const box = $('params'); box.innerHTML = '';
+  for (const q of o.params){ const lab = document.createElement('label'); lab.innerHTML = `${q.l} <span class="v"></span><input type="range" min="${q.min}" max="${q.max}" step="${q.step}" value="${main[q.k]}">`; const inp = lab.querySelector('input'), v = lab.querySelector('.v'); v.textContent = main[q.k]; inp.addEventListener('input', () => { main[q.k] = +inp.value; v.textContent = inp.value; delete main._s; showJson(); }); box.appendChild(lab); }
+  showJson(); document.querySelectorAll('#list .it').forEach(d => d.classList.toggle('sel', +d.dataset.i === i));
+  const d = document.querySelector(`#list .it[data-i="${i}"]`); if (d) d.scrollIntoView({ block: 'nearest' });
+}
+const WALL_O = { prims(p, t, e, o){ o.push({ k: 'rect', x: p.x, y: p.y, w: p.w, h: p.h, c: 'wall' }); } };
+const ORBIT_O = { prims: (p, t, e, o) => orbitPrims(p, t, o), draw(p, t, e, L){ if (L !== 'under') return; ctx.save(); ctx.strokeStyle = C.haz; ctx.globalAlpha = 0.18; ctx.setLineDash([6, 8]); ctx.beginPath(); ctx.arc(p.x, p.y, p.R, 0, TAU); ctx.stroke(); ctx.restore(); } };
+function showJson(){ const q = { ...main }; delete q._o; delete q._s; $('json').textContent = JSON.stringify(q); }
+function resetRun(){ t0 = performance.now(); surviveStart = t0; deaths = 0; history = []; for (const p of pieces) delete p._s; trail = []; particles = []; }
+$('reset').addEventListener('click', resetRun);
+$('copy').addEventListener('click', () => { const q = { ...main }; delete q._o; delete q._s; navigator.clipboard.writeText(JSON.stringify(q)).catch(() => {}); });
+addEventListener('keydown', e => { if (e.key === 'ArrowDown'){ e.preventDefault(); select((sel + 1) % CATALOG.length); } if (e.key === 'ArrowUp'){ e.preventDefault(); select((sel - 1 + CATALOG.length) % CATALOG.length); } });
+
+// ===== ループ =====
+let view = { s: 1, ox: 0, oy: 0, dpr: 1 };
+function resize(){ const dpr = Math.min(2, devicePixelRatio || 1), w = stage.clientWidth, h = stage.clientHeight; cvs.width = Math.round(w * dpr); cvs.height = Math.round(h * dpr); const s = Math.min(w / T.W, h / T.H); view = { s, ox: (w - T.W * s) / 2, oy: (h - T.H * s) / 2, dpr }; }
+addEventListener('resize', resize); resize();
+const toL = e => { const b = cvs.getBoundingClientRect(); return { x: (e.clientX - b.left - view.ox) / view.s, y: (e.clientY - b.top - view.oy) / view.s }; };
+let cur = { x: -999, y: -999 }, have = false, samples = [], trail = [], particles = [], history = [];
+let deaths = 0, invulnUntil = 0, t0 = performance.now(), surviveStart = t0, bestSurvive = 0, flash = 0, fpsT = 0, fpsN = 0, speed = 0;
+cvs.addEventListener('pointermove', e => { for (const ev of (e.getCoalescedEvents ? e.getCoalescedEvents() : [e])) samples.push(toL(ev)); });
+cvs.addEventListener('pointerdown', e => samples.push(toL(e)));
+cvs.addEventListener('pointerleave', () => { have = false; });
+addEventListener('contextmenu', e => e.preventDefault());
+function die(now){
+  deaths++; invulnUntil = now + T.INVULN * 1000; flash = 1; bestSurvive = Math.max(bestSurvive, (now - surviveStart) / 1000); surviveStart = now;
+  for (let i = 0; i < 36; i++){ const a = Math.random() * TAU, v = 120 + Math.random() * 400; particles.push({ x: cur.x, y: cur.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.4 + Math.random() * 0.5, c: i % 3 ? C.haz : '#fff' }); }
+  trail = [];
+}
+let lastNow = performance.now();
+function update(now){
+  const dt = Math.min(0.05, (now - lastNow) / 1000); lastNow = now;
+  const t = (now - t0) / 1000, alive = now >= invulnUntil, prevCur = { x: cur.x, y: cur.y }, hadCur = have;
+  const pcs = $('walls').checked ? [...pieces, ...WALLS.map(w => ({ ...w, _o: WALL_O }))] : pieces;
+  const env = { t, now, cur, prev: hadCur ? prevCur : null, have, speed, history, dt };
+  for (const p of pcs) if (p._o && p._o.update) p._o.update(p, env, dt);
+  const ps = []; for (const p of pcs) if (p._o && p._o.prims) p._o.prims(p, t, env, ps);
+  for (const s of samples){
+    if (alive && have){ const h = sweepHit(ps, cur.x, cur.y, s.x, s.y); if (h){ cur = s; die(now); have = true; continue; } }
+    cur = s; have = true;
+    const last = trail[trail.length - 1]; if (!last || Math.hypot(last.x - cur.x, last.y - cur.y) >= T.TRAIL_GAP) trail.push({ x: cur.x, y: cur.y, t: now });
+  }
+  samples.length = 0;
+  speed = dt > 0 && hadCur && have ? Math.hypot(cur.x - prevCur.x, cur.y - prevCur.y) / dt : 0;
+  env.cur = cur; env.have = have; env.speed = speed; env.prev = hadCur ? prevCur : null;
+  if (have){ history.push({ x: cur.x, y: cur.y, t }); while (history.length && history[0].t < t - 10) history.shift(); }
+  if (alive && have){ if (sweepHit(ps, cur.x, cur.y, cur.x, cur.y)) die(now); else for (const p of pcs) if (p._o && p._o.check && p._o.check(p, env)){ die(now); break; } }
+  while (trail.length && trail[0].t < now - T.TRAIL_LIFE * 1000) trail.shift();
+  for (const p of particles){ p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.9; p.vy *= 0.9; p.life -= dt; } particles = particles.filter(p => p.life > 0);
+  flash = Math.max(0, flash - dt * 3);
+  fpsN++; if (now - fpsT > 500){ $('hFps').textContent = Math.round(fpsN * 1000 / (now - fpsT)); fpsT = now; fpsN = 0; }
+  $('hTime').textContent = ((now - surviveStart) / 1000).toFixed(1); $('hBest').textContent = bestSurvive.toFixed(1); $('hDeaths').textContent = deaths; $('hSpeed').textContent = Math.round(speed); $('hPrims').textContent = ps.length;
+  draw(now, t, pcs, ps, env, alive);
+}
+function draw(now, t, pcs, ps, env, alive){
+  const { s, ox, oy, dpr } = view;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.fillStyle = '#07090f'; ctx.fillRect(0, 0, cvs.width, cvs.height);
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, ox * dpr, oy * dpr);
+  ctx.fillStyle = '#0d1220'; ctx.fillRect(0, 0, T.W, T.H);
+  ctx.strokeStyle = '#141b2d'; ctx.lineWidth = 1; ctx.beginPath(); for (let x = 80; x < T.W; x += 80){ ctx.moveTo(x, 0); ctx.lineTo(x, T.H); } for (let y = 80; y < T.H; y += 80){ ctx.moveTo(0, y); ctx.lineTo(T.W, y); } ctx.stroke();
+  if (flash > 0){ ctx.fillStyle = C.haz; ctx.globalAlpha = flash * 0.25; ctx.fillRect(0, 0, T.W, T.H); ctx.globalAlpha = 1; }
+  for (const p of pcs) if (p._o && p._o.draw) p._o.draw(p, t, env, 'under');
+  for (const pr of ps){ if (pr.c === 'hidden') continue;
+    if (pr.k === 'rect'){ if (pr.c === 'wall'){ ctx.fillStyle = '#2b3650'; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.strokeStyle = '#5a6d94'; ctx.lineWidth = 2; ctx.strokeRect(pr.x + 1, pr.y + 1, pr.w - 2, pr.h - 2); }
+      else if (pr.on === false){ ctx.save(); ctx.globalAlpha = 0.12; ctx.fillStyle = C.haz; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.restore(); }
+      else { ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.fillStyle = C.haz; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.restore(); } }
+    else if (pr.k === 'circ'){ const col = pr.c === 'bullet' ? C.bullet : C.haz; ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = pr.c === 'bullet' ? 10 : 14; ctx.beginPath(); ctx.arc(pr.x, pr.y, pr.r, 0, TAU); ctx.fillStyle = col; ctx.fill(); ctx.shadowBlur = 0; if (pr.c === 'bullet' && pr.r >= 4){ ctx.beginPath(); ctx.arc(pr.x, pr.y, pr.r * 0.45, 0, TAU); ctx.fillStyle = '#ffe3e9'; ctx.fill(); } ctx.restore(); }
+    else if (pr.k === 'cap'){ ctx.save(); ctx.lineCap = 'round'; if (pr.c === 'laser'){ if (pr.on !== false){ ctx.shadowColor = C.laser; ctx.shadowBlur = 16; ctx.strokeStyle = C.laser; ctx.lineWidth = pr.r * 2; } else { ctx.strokeStyle = C.laser; ctx.globalAlpha = 0.25; ctx.lineWidth = 2; ctx.setLineDash([4, 8]); } } else { ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.strokeStyle = C.haz; ctx.lineWidth = pr.r * 2; }
+      ctx.beginPath(); ctx.moveTo(pr.ax, pr.ay); ctx.lineTo(pr.bx, pr.by); ctx.stroke(); ctx.restore(); if (pr.hub){ ctx.beginPath(); ctx.arc(pr.hub.x, pr.hub.y, pr.r + 4, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.stroke(); } } }
+  for (const p of pcs) if (p._o && p._o.draw) p._o.draw(p, t, env, 'over');
+  for (const p of particles){ ctx.globalAlpha = Math.min(1, p.life * 2); ctx.fillStyle = p.c; ctx.fillRect(p.x - 2, p.y - 2, 4, 4); } ctx.globalAlpha = 1;
+  ctx.fillStyle = C.player; for (const d of trail){ const f = 1 - (now - d.t) / (T.TRAIL_LIFE * 1000); if (f <= 0) continue; ctx.globalAlpha = 0.9 * f; ctx.beginPath(); ctx.arc(d.x, d.y, 5 * (0.3 + 0.7 * f), 0, TAU); ctx.fill(); } ctx.globalAlpha = 1;
+  if (have){ ctx.save(); ctx.shadowColor = C.player; ctx.shadowBlur = alive ? 18 : 0; ctx.beginPath(); ctx.arc(cur.x, cur.y, 8, 0, TAU); if (alive){ ctx.fillStyle = C.player; ctx.fill(); ctx.shadowBlur = 0; ctx.beginPath(); ctx.arc(cur.x, cur.y, 3.5, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill(); } else { ctx.strokeStyle = '#8d97ad'; ctx.lineWidth = 2; ctx.setLineDash([3, 3]); ctx.stroke(); } ctx.restore(); }
+  for (const p of pcs) if (p._o && p._o.draw) p._o.draw(p, t, env, 'top');
+  if (have){ ctx.beginPath(); ctx.arc(cur.x, cur.y, 3, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill(); }
+  text(CATALOG[sel].code + ' ' + CATALOG[sel].name, T.W / 2, 24, 18, C.fg, 'center');
+}
+buildList(); select(0);
+function loop(now){ try { update(now); } catch (e) { console.error(e); } requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>

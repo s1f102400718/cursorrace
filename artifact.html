@@ -1,0 +1,779 @@
+<title>Cursor Run</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&display=swap">
+<style>
+/* Layout: one fixed 16:9 arena letterboxed into the window; HUD floats over it. Single dark arcade theme by choice. */
+:root{
+  --bg:#07090f; --arena:#0d1220; --grid:#141b2d; --fg:#e6ecf5; --dim:#7d8aa3;
+  --wall:#2b3650; --wall-edge:#5a6d94; --haz:#ff3b5c; --laser:#ff4fd8; --start:#49e07c; --cp:#4fd3ff; --exit:#ffd044;
+  --player:#5ee1ff; --ghost:#8d97ad; --card:#121a2c; --card-hi:#1b2742;
+  --font:"Chakra Petch",ui-monospace,Consolas,monospace;
+  color-scheme:dark;
+}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--font);overflow:hidden}
+#c{display:block;width:100%;height:100%;cursor:none;touch-action:none;user-select:none}
+#hud{position:fixed;left:max(14px,env(safe-area-inset-left,0px));top:max(10px,env(safe-area-inset-top,0px));pointer-events:none;font-size:15px;font-weight:700;letter-spacing:.04em;text-shadow:0 1px 2px #000;font-variant-numeric:tabular-nums;display:flex;flex-direction:column;gap:2px}
+#hud .big{font-size:30px;line-height:1}
+#hud .dim{color:var(--dim);font-weight:500}
+#msg{position:fixed;left:0;right:0;bottom:max(8vh,env(safe-area-inset-bottom,0px));text-align:center;pointer-events:none;padding-inline:max(16px,env(safe-area-inset-left,0px)) max(16px,env(safe-area-inset-right,0px))}
+#msg h1{margin:0;font-size:clamp(28px,6vw,64px);letter-spacing:.12em;text-wrap:balance}
+#msg p{margin:6px 0 0;color:var(--dim);font-size:clamp(13px,1.8vw,17px);font-weight:500}
+#msg .res{display:inline-grid;grid-template-columns:auto auto;gap:2px 18px;margin-top:10px;font-size:15px;text-align:left;font-variant-numeric:tabular-nums}
+#msg .medal{display:inline-block;margin-top:8px;padding:4px 14px;border-radius:999px;font-weight:700;letter-spacing:.1em}
+#keys{position:fixed;right:max(14px,env(safe-area-inset-right,0px));top:max(10px,env(safe-area-inset-top,0px));color:var(--dim);font-size:12px;font-weight:500;text-align:right;pointer-events:none;line-height:1.5}
+</style>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="big" id="hTime">0.00</div>
+  <div><span id="hRoom"></span> <span class="dim" id="hName"></span></div>
+  <div class="dim" id="hLine3">DEATHS <span id="hDeaths">0</span> · BEST <span id="hBest">--</span></div>
+  <div class="dim" id="hDbg" hidden></div>
+</div>
+<div id="keys">R リスタート · M メニュー · G ゴースト · D デバッグ</div>
+<div id="msg"></div>
+<script>
+'use strict';
+// ===================== 調整値 =====================
+const T = {
+  W: 1280, H: 720,     // 部屋の論理サイズ
+  HEAD_R: 4,           // 当たり判定半径（カーソル点）
+  PAD_R: 46,           // スタート/CP/出口パッド半径
+  TRAIL_LIFE: 0.7,     // 尻尾ドットが消えるまでの秒
+  TRAIL_GAP: 5,        // ドットを落とす間隔(px)
+  TRAIL_R: 5,          // ドット半径
+  COUNTDOWN: 2.0,      // スタートパッド静止秒
+  GHOST_HZ: 30,        // ゴースト記録レート
+  POS_HZ: 20,          // マルチ: カーソル送信レート
+};
+const COURSE_VER = 'v0.2';
+
+// ===================== ピース =====================
+// wall    静止矩形                 x,y,w,h
+// slider  矩形が往復               x,y,w,h,dx,dy,period,phase
+// bar     線分が回転               x,y,len,thick,rpm,phase, blades(羽根数), anchor:'end'(端を軸に)
+// pulser  円が脈動                 x,y,rmin,rmax,period,phase
+// orbit   円が円軌道を周回         x,y,R,r,rpm,phase
+// gate    レーザー線が点滅         ax,ay,bx,by,thick,period,duty,phase
+// blink   壁が点滅                 x,y,w,h,period,duty,phase
+// shooter 弾を一定間隔で発射       x,y,dx,dy(単位方向),speed,interval,r,range,phase
+const TAU = Math.PI * 2;
+function osc(t, period, phase){ return (1 - Math.cos(TAU * (t / period + (phase || 0)))) / 2; }
+function frac(v){ return (v % 1 + 1) % 1; }
+function prims(room, t){
+  const out = [];
+  for (const p of room.pieces){
+    switch (p.t){
+      case 'wall': out.push({ k: 'rect', x: p.x, y: p.y, w: p.w, h: p.h, c: 'wall', src: p }); break;
+      case 'slider': { const s = osc(t, p.period, p.phase);
+        out.push({ k: 'rect', x: p.x + (p.dx || 0) * s, y: p.y + (p.dy || 0) * s, w: p.w, h: p.h, c: 'haz', src: p }); break; }
+      case 'bar': { const n = p.blades || 1, base = (p.phase || 0) * TAU + t * p.rpm * TAU / 60;
+        for (let k = 0; k < n; k++){ const a = base + k * TAU / n, cx = Math.cos(a), sy = Math.sin(a);
+          if (p.anchor === 'end') out.push({ k: 'cap', ax: p.x, ay: p.y, bx: p.x + cx * p.len, by: p.y + sy * p.len, r: p.thick / 2, c: 'haz', src: p });
+          else out.push({ k: 'cap', ax: p.x - cx * p.len / 2, ay: p.y - sy * p.len / 2, bx: p.x + cx * p.len / 2, by: p.y + sy * p.len / 2, r: p.thick / 2, c: 'haz', src: p }); }
+        break; }
+      case 'pulser': { const s = osc(t, p.period, p.phase);
+        out.push({ k: 'circ', x: p.x, y: p.y, r: p.rmin + (p.rmax - p.rmin) * s, c: 'haz', src: p }); break; }
+      case 'orbit': { const a = (p.phase || 0) * TAU + t * p.rpm * TAU / 60;
+        out.push({ k: 'circ', x: p.x + Math.cos(a) * p.R, y: p.y + Math.sin(a) * p.R, r: p.r, c: 'haz', src: p }); break; }
+      case 'gate': { const on = frac(t / p.period + (p.phase || 0)) < p.duty;
+        out.push({ k: 'cap', ax: p.ax, ay: p.ay, bx: p.bx, by: p.by, r: p.thick / 2, c: 'laser', on, src: p }); break; }
+      case 'blink': { const on = frac(t / p.period + (p.phase || 0)) < p.duty;
+        out.push({ k: 'rect', x: p.x, y: p.y, w: p.w, h: p.h, c: 'blink', on, src: p }); break; }
+      case 'shooter': { const nb = Math.ceil(p.range / (p.speed * p.interval)), f = frac(t / p.interval + (p.phase || 0));
+        for (let k = 0; k < nb; k++){ const d = (f + k) * p.interval * p.speed; if (d > p.range) break;
+          out.push({ k: 'circ', x: p.x + p.dx * d, y: p.y + p.dy * d, r: p.r, c: 'haz', src: p }); }
+        break; }
+    }
+  }
+  return out;
+}
+// 設置の検証（server.js と同じもの）
+function bounds(p){
+  switch (p.t){
+    case 'wall': case 'blink': return { x: p.x, y: p.y, w: p.w, h: p.h };
+    case 'slider': return { x: p.x + Math.min(0, p.dx || 0), y: p.y + Math.min(0, p.dy || 0), w: p.w + Math.abs(p.dx || 0), h: p.h + Math.abs(p.dy || 0) };
+    case 'bar': { const r = (p.anchor === 'end' ? p.len : p.len / 2) + p.thick / 2; return { x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }; }
+    case 'pulser': return { x: p.x - p.rmax, y: p.y - p.rmax, w: 2 * p.rmax, h: 2 * p.rmax };
+    case 'orbit': { const r = p.R + p.r; return { x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }; }
+    case 'gate': { const r = p.thick / 2; return { x: Math.min(p.ax, p.bx) - r, y: Math.min(p.ay, p.by) - r, w: Math.abs(p.ax - p.bx) + 2 * r, h: Math.abs(p.ay - p.by) + 2 * r }; }
+    case 'shooter': { const ex = p.x + p.dx * p.range, ey = p.y + p.dy * p.range, r = p.r; return { x: Math.min(p.x, ex) - r, y: Math.min(p.y, ey) - r, w: Math.abs(ex - p.x) + 2 * r, h: Math.abs(ey - p.y) + 2 * r }; }
+  }
+  return { x: p.x, y: p.y, w: 0, h: 0 };
+}
+function translate(p, cx, cy){ const q = { ...p }; if (p.t === 'gate'){ q.ax += cx; q.bx += cx; q.ay += cy; q.by += cy; } else { q.x += cx; q.y += cy; } return q; }
+function rectCircleClear(b, c, r){ const dx = Math.max(b.x - c.x, 0, c.x - (b.x + b.w)), dy = Math.max(b.y - c.y, 0, c.y - (b.y + b.h)); return Math.hypot(dx, dy) > r; }
+function placementOk(rel, cx, cy, start, goal){
+  if (cx < 0 || cy < 0 || cx > T.W || cy > T.H) return false;
+  const p = translate(rel, cx, cy), b = bounds(p), mustFit = p.t === 'wall' || p.t === 'blink' || p.t === 'slider' || p.t === 'gate';
+  if (mustFit && (b.x < 0 || b.y < 0 || b.x + b.w > T.W || b.y + b.h > T.H)) return false;
+  return rectCircleClear(b, start, T.PAD_R + 10) && rectCircleClear(b, goal, T.PAD_R + 10);
+}
+
+// ===================== コース =====================
+// 部屋 = { name, exit:{x,y}, cps:[{x,y}], pieces:[...] }。入口は前の部屋の exit（最初は course.start）。
+const COURSES = [
+{ id: 'normal', name: 'NORMAL', desc: '基本の4部屋', medals: [20, 30, 45], start: { x: 90, y: 360 }, rooms: [
+  { name: 'WARM UP', exit: { x: 1190, y: 360 }, cps: [{ x: 800, y: 600 }], pieces: [
+    { t: 'wall', x: 330, y: 0, w: 40, h: 480 },
+    { t: 'wall', x: 630, y: 240, w: 40, h: 480 },
+    { t: 'wall', x: 930, y: 0, w: 40, h: 480 },
+  ]},
+  { name: 'SLIDERS', exit: { x: 90, y: 360 }, cps: [{ x: 580, y: 360 }], pieces: [
+    { t: 'slider', x: 940, y: 0, w: 44, h: 220, dy: 500, period: 2.4, phase: 0 },
+    { t: 'slider', x: 700, y: 0, w: 44, h: 220, dy: 500, period: 2.0, phase: 0.35 },
+    { t: 'slider', x: 460, y: 0, w: 44, h: 220, dy: 500, period: 2.8, phase: 0.7 },
+    { t: 'orbit', x: 300, y: 360, R: 110, r: 22, rpm: 40, phase: 0 },
+  ]},
+  { name: 'SPIN', exit: { x: 1190, y: 360 }, cps: [{ x: 640, y: 360 }], pieces: [
+    { t: 'bar', x: 380, y: 360, len: 400, thick: 16, rpm: 22, phase: 0 },
+    { t: 'bar', x: 900, y: 360, len: 400, thick: 16, rpm: -28, phase: 0.25 },
+    { t: 'pulser', x: 640, y: 130, rmin: 24, rmax: 100, period: 2.2, phase: 0 },
+    { t: 'pulser', x: 640, y: 590, rmin: 24, rmax: 100, period: 2.2, phase: 0.5 },
+  ]},
+  { name: 'GAUNTLET', exit: { x: 90, y: 360 }, cps: [{ x: 650, y: 360 }], pieces: [
+    { t: 'pulser', x: 1060, y: 160, rmin: 20, rmax: 90, period: 1.8, phase: 0 },
+    { t: 'pulser', x: 1060, y: 560, rmin: 20, rmax: 90, period: 1.8, phase: 0.5 },
+    { t: 'wall', x: 300, y: 0, w: 680, h: 280 },
+    { t: 'wall', x: 300, y: 440, w: 680, h: 280 },
+    { t: 'gate', ax: 940, ay: 280, bx: 940, by: 440, thick: 8, period: 1.5, duty: 0.5, phase: 0 },
+    { t: 'gate', ax: 800, ay: 280, bx: 800, by: 440, thick: 8, period: 1.5, duty: 0.5, phase: 0.25 },
+    { t: 'gate', ax: 500, ay: 280, bx: 500, by: 440, thick: 8, period: 1.5, duty: 0.5, phase: 0.5 },
+    { t: 'gate', ax: 360, ay: 280, bx: 360, by: 440, thick: 8, period: 1.5, duty: 0.5, phase: 0.75 },
+    { t: 'slider', x: 220, y: 0, w: 30, h: 200, dy: 520, period: 2.0, phase: 0 },
+  ]},
+]},
+{ id: 'hard', name: 'HARD', desc: '6部屋。砲台・振り子・点滅壁', medals: [40, 60, 90], start: { x: 90, y: 360 }, rooms: [
+  { name: 'NEEDLE', exit: { x: 1190, y: 360 }, cps: [{ x: 550, y: 80 }, { x: 950, y: 640 }], pieces: [
+    { t: 'wall', x: 250, y: 0, w: 30, h: 560 },
+    { t: 'wall', x: 450, y: 160, w: 30, h: 560 },
+    { t: 'wall', x: 650, y: 0, w: 30, h: 560 },
+    { t: 'wall', x: 850, y: 160, w: 30, h: 560 },
+    { t: 'wall', x: 1050, y: 0, w: 30, h: 560 },
+    { t: 'orbit', x: 365, y: 360, R: 70, r: 14, rpm: 60, phase: 0 },
+    { t: 'orbit', x: 765, y: 360, R: 70, r: 14, rpm: -60, phase: 0.5 },
+    { t: 'pulser', x: 160, y: 640, rmin: 10, rmax: 60, period: 1.6, phase: 0 },
+    { t: 'pulser', x: 1160, y: 80, rmin: 10, rmax: 60, period: 1.6, phase: 0.5 },
+  ]},
+  { name: 'CROSSFIRE', exit: { x: 90, y: 360 }, cps: [{ x: 640, y: 360 }], pieces: [
+    { t: 'shooter', x: 1000, y: -30, dx: 0, dy: 1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0 },
+    { t: 'shooter', x: 820, y: -30, dx: 0, dy: 1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.3 },
+    { t: 'shooter', x: 460, y: -30, dx: 0, dy: 1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.6 },
+    { t: 'shooter', x: 280, y: -30, dx: 0, dy: 1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.15 },
+    { t: 'shooter', x: 900, y: 750, dx: 0, dy: -1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.45 },
+    { t: 'shooter', x: 720, y: 750, dx: 0, dy: -1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.75 },
+    { t: 'shooter', x: 560, y: 750, dx: 0, dy: -1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.05 },
+    { t: 'shooter', x: 360, y: 750, dx: 0, dy: -1, speed: 420, interval: 0.9, r: 12, range: 780, phase: 0.5 },
+  ]},
+  { name: 'SWEEP', exit: { x: 1190, y: 360 }, cps: [], pieces: [
+    { t: 'bar', x: 640, y: 0, len: 560, thick: 14, rpm: 12, phase: 0, anchor: 'end' },
+    { t: 'bar', x: 640, y: 720, len: 560, thick: 14, rpm: -12, phase: 0.5, anchor: 'end' },
+    { t: 'pulser', x: 640, y: 200, rmin: 20, rmax: 70, period: 2.0, phase: 0 },
+    { t: 'pulser', x: 640, y: 520, rmin: 20, rmax: 70, period: 2.0, phase: 0.5 },
+  ]},
+  { name: 'BLINK', exit: { x: 90, y: 360 }, cps: [{ x: 650, y: 360 }], pieces: (() => {
+    const out = [], cols = [1010, 880, 750, 530, 400, 270], rows = [0, 240, 480];
+    cols.forEach((x, i) => rows.forEach((y, j) => out.push({ t: 'blink', x, y, w: 60, h: 240, period: 1.6, duty: 0.5, phase: ((i + j) % 2) * 0.5 })));
+    return out; })() },
+  { name: 'ORBITAL', exit: { x: 1190, y: 360 }, cps: [{ x: 640, y: 360 }], pieces: [
+    { t: 'orbit', x: 640, y: 360, R: 120, r: 20, rpm: 30, phase: 0 },
+    { t: 'orbit', x: 640, y: 360, R: 120, r: 20, rpm: 30, phase: 0.5 },
+    { t: 'orbit', x: 640, y: 360, R: 200, r: 20, rpm: -24, phase: 0 },
+    { t: 'orbit', x: 640, y: 360, R: 200, r: 20, rpm: -24, phase: 0.33 },
+    { t: 'orbit', x: 640, y: 360, R: 200, r: 20, rpm: -24, phase: 0.66 },
+    { t: 'orbit', x: 640, y: 360, R: 280, r: 20, rpm: 18, phase: 0 },
+    { t: 'orbit', x: 640, y: 360, R: 280, r: 20, rpm: 18, phase: 0.25 },
+    { t: 'orbit', x: 640, y: 360, R: 280, r: 20, rpm: 18, phase: 0.5 },
+    { t: 'orbit', x: 640, y: 360, R: 280, r: 20, rpm: 18, phase: 0.75 },
+    { t: 'pulser', x: 300, y: 100, rmin: 16, rmax: 70, period: 1.8, phase: 0 },
+    { t: 'pulser', x: 980, y: 620, rmin: 16, rmax: 70, period: 1.8, phase: 0.5 },
+  ]},
+  { name: 'FINALE', exit: { x: 90, y: 360 }, cps: [{ x: 680, y: 360 }], pieces: [
+    { t: 'shooter', x: 1080, y: -30, dx: 0, dy: 1, speed: 460, interval: 0.8, r: 12, range: 780, phase: 0 },
+    { t: 'wall', x: 320, y: 0, w: 660, h: 300 },
+    { t: 'wall', x: 320, y: 420, w: 660, h: 300 },
+    { t: 'gate', ax: 920, ay: 300, bx: 920, by: 420, thick: 8, period: 1.2, duty: 0.55, phase: 0 },
+    { t: 'gate', ax: 760, ay: 300, bx: 760, by: 420, thick: 8, period: 1.2, duty: 0.55, phase: 0.25 },
+    { t: 'gate', ax: 600, ay: 300, bx: 600, by: 420, thick: 8, period: 1.2, duty: 0.55, phase: 0.5 },
+    { t: 'gate', ax: 440, ay: 300, bx: 440, by: 420, thick: 8, period: 1.2, duty: 0.55, phase: 0.75 },
+    { t: 'slider', x: 230, y: 0, w: 30, h: 220, dy: 500, period: 1.6, phase: 0 },
+  ]},
+]},
+{ id: 'extreme', name: 'EXTREME', desc: '4部屋。チェックポイントほぼ無し', medals: [45, 75, 120], start: { x: 90, y: 360 }, rooms: [
+  { name: 'THREAD', exit: { x: 1190, y: 360 }, cps: [], pieces: [
+    { t: 'wall', x: 200, y: 0, w: 880, h: 315 },
+    { t: 'wall', x: 200, y: 405, w: 880, h: 315 },
+    { t: 'orbit', x: 400, y: 360, R: 18, r: 6, rpm: 90, phase: 0 },
+    { t: 'orbit', x: 640, y: 360, R: 18, r: 6, rpm: -90, phase: 0.5 },
+    { t: 'orbit', x: 880, y: 360, R: 18, r: 6, rpm: 90, phase: 0.25 },
+  ]},
+  { name: 'BARRAGE', exit: { x: 90, y: 360 }, cps: [{ x: 640, y: 360 }], pieces: (() => {
+    const out = [];
+    [1000, 850, 700, 550, 400, 250].forEach((x, i) => out.push({ t: 'shooter', x, y: -20, dx: 0, dy: 1, speed: 480, interval: 0.7, r: 10, range: 760, phase: i * 0.17 }));
+    [150, 570].forEach((y, i) => out.push({ t: 'shooter', x: -20, y, dx: 1, dy: 0, speed: 520, interval: 0.6, r: 10, range: 1000, phase: i * 0.5 }));
+    [200, 520].forEach((y, i) => out.push({ t: 'shooter', x: 1300, y, dx: -1, dy: 0, speed: 520, interval: 0.6, r: 10, range: 1000, phase: 0.25 + i * 0.5 }));
+    return out; })() },
+  { name: 'VORTEX', exit: { x: 1190, y: 360 }, cps: [{ x: 640, y: 60 }, { x: 640, y: 660 }], pieces: [
+    { t: 'bar', x: 400, y: 360, len: 440, thick: 14, rpm: 36, phase: 0, blades: 3 },
+    { t: 'bar', x: 880, y: 360, len: 440, thick: 14, rpm: -36, phase: 0.1, blades: 3 },
+    { t: 'orbit', x: 640, y: 360, R: 60, r: 16, rpm: 80, phase: 0 },
+    // 縁を這う抜け道を塞ぎ、刃の中に潜らせる
+    { t: 'wall', x: 380, y: 0, w: 40, h: 150 },
+    { t: 'wall', x: 860, y: 0, w: 40, h: 150 },
+    { t: 'wall', x: 380, y: 570, w: 40, h: 150 },
+    { t: 'wall', x: 860, y: 570, w: 40, h: 150 },
+  ]},
+  { name: 'DEATHROW', exit: { x: 90, y: 360 }, cps: [{ x: 680, y: 100 }], pieces: (() => {
+    const out = [], cols = [1000, 860, 500, 360], rows = [0, 240, 480];
+    cols.forEach((x, i) => rows.forEach((y, j) => out.push({ t: 'blink', x, y, w: 60, h: 240, period: 1.2, duty: 0.5, phase: ((i + j) % 2) * 0.5 })));
+    out.push({ t: 'bar', x: 680, y: 720, len: 420, thick: 14, rpm: 20, phase: 0.5, anchor: 'end' });
+    out.push({ t: 'pulser', x: 680, y: 360, rmin: 20, rmax: 80, period: 1.5, phase: 0 });
+    return out; })() },
+]},
+];
+let course = COURSES[0], ROOMS = course.rooms, START = course.start;
+function roomEntry(i){ return i === 0 ? START : ROOMS[i - 1].exit; }
+
+// ===================== 幾何 =====================
+function segPointDist(ax, ay, bx, by, px, py){
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  let u = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0; u = u < 0 ? 0 : u > 1 ? 1 : u;
+  const x = ax + dx * u - px, y = ay + dy * u - py; return Math.hypot(x, y);
+}
+function orient(ax, ay, bx, by, cx, cy){ return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax); }
+function segIntersect(ax, ay, bx, by, cx, cy, dx, dy){
+  const o1 = orient(ax, ay, bx, by, cx, cy), o2 = orient(ax, ay, bx, by, dx, dy), o3 = orient(cx, cy, dx, dy, ax, ay), o4 = orient(cx, cy, dx, dy, bx, by);
+  return (o1 * o2 < 0) && (o3 * o4 < 0);
+}
+function segSegDist(ax, ay, bx, by, cx, cy, dx, dy){
+  if (segIntersect(ax, ay, bx, by, cx, cy, dx, dy)) return 0;
+  return Math.min(segPointDist(ax, ay, bx, by, cx, cy), segPointDist(ax, ay, bx, by, dx, dy), segPointDist(cx, cy, dx, dy, ax, ay), segPointDist(cx, cy, dx, dy, bx, by));
+}
+// Liang–Barsky: 線分 vs 矩形（点なら内包判定になる）
+function segRect(x0, y0, x1, y1, xmin, ymin, xmax, ymax){
+  let t0 = 0, t1 = 1; const dx = x1 - x0, dy = y1 - y0;
+  const p = [-dx, dx, -dy, dy], q = [x0 - xmin, xmax - x0, y0 - ymin, ymax - y0];
+  for (let i = 0; i < 4; i++){
+    if (p[i] === 0){ if (q[i] < 0) return false; }
+    else { const r = q[i] / p[i]; if (p[i] < 0){ if (r > t1) return false; if (r > t0) t0 = r; } else { if (r < t0) return false; if (r < t1) t1 = r; } }
+  }
+  return true;
+}
+// 掃引: 前位置 a → 現位置 b の線分（半径 r）がプリミティブに触れるか
+function hit(pr, ax, ay, bx, by, r){
+  if (pr.on === false) return false;
+  if (pr.k === 'rect') return segRect(ax, ay, bx, by, pr.x - r, pr.y - r, pr.x + pr.w + r, pr.y + pr.h + r);
+  if (pr.k === 'circ') return segPointDist(ax, ay, bx, by, pr.x, pr.y) <= pr.r + r;
+  if (pr.k === 'cap') return segSegDist(ax, ay, bx, by, pr.ax, pr.ay, pr.bx, pr.by) <= pr.r + r;
+  return false;
+}
+function sweepHit(ps, ax, ay, bx, by){
+  const r = T.HEAD_R;
+  if (bx < r || by < r || bx > T.W - r || by > T.H - r) return 'bounds';
+  for (const pr of ps) if (hit(pr, ax, ay, bx, by, r)) return pr;
+  return null;
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+
+// ===================== 状態 =====================
+const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
+const H = { time: document.getElementById('hTime'), room: document.getElementById('hRoom'), name: document.getElementById('hName'), line3: document.getElementById('hLine3'),
+  deaths: document.getElementById('hDeaths'), best: document.getElementById('hBest'), dbg: document.getElementById('hDbg'), msg: document.getElementById('msg') };
+let view = { s: 1, ox: 0, oy: 0 };
+let state = 'menu';           // menu | title | count | race | dead | done | mp
+let cur = { x: -999, y: -999 }, have = false, samples = [], clicks = [];
+let roomIdx = 0, cp = START, cpsHit = new Set();
+let goTime = 0, elapsed = 0, countEnd = 0, deaths = 0, splits = [], finalTime = 0, deathMark = null, flyFlash = 0;
+let trail = [], particles = [], speed = 0, maxSpeed = 0, falseStarts = 0;
+let best = null, ghostOn = true, debug = false, gRec = [], gLastT = -1, gi = 0, gTrail = [];
+function bestKey(c){ return 'cursorrun.best.' + c.id + '.' + COURSE_VER; }
+function loadBest(c){ try { const b = localStorage.getItem(bestKey(c)); return b ? JSON.parse(b) : null; } catch (e) { return null; } }
+// 尻尾: カーソルが通った位置にドットを落とし、TRAIL_LIFE 秒で消える
+function dropDot(tr, x, y, now){
+  const last = tr[tr.length - 1];
+  if (last && Math.hypot(last.x - x, last.y - y) < T.TRAIL_GAP) return;
+  tr.push({ x, y, t: now });
+}
+function pruneTrail(tr, now){ const lim = now - T.TRAIL_LIFE * 1000; let i = 0; while (i < tr.length && tr[i].t < lim) i++; if (i) tr.splice(0, i); }
+
+function resize(){
+  const dpr = Math.min(2, window.devicePixelRatio || 1), w = window.innerWidth, h = window.innerHeight;
+  cvs.width = Math.round(w * dpr); cvs.height = Math.round(h * dpr);
+  const s = Math.min(w / T.W, h / T.H); view = { s, ox: (w - T.W * s) / 2, oy: (h - T.H * s) / 2, dpr };
+}
+window.addEventListener('resize', resize); resize();
+const toL = e => ({ x: (e.clientX - view.ox) / view.s, y: (e.clientY - view.oy) / view.s });
+
+cvs.addEventListener('pointermove', e => { const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e]; if (!evs.length) evs.push(e); for (const ev of evs) samples.push(toL(ev)); });
+cvs.addEventListener('pointerdown', e => { const p = toL(e); samples.push(p); clicks.push(p); });
+cvs.addEventListener('pointerleave', () => { samples.push({ x: -9999, y: -9999, out: true }); });
+window.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (state === 'mp'){
+    if (k === 'm') mpLeave();
+    if (k === 'enter') mpKeyReady();
+    if (k === ' '){ e.preventDefault(); mpKeyPass(); }
+    if (k === 'd'){ debug = !debug; H.dbg.hidden = !debug; }
+    return;
+  }
+  if (k === 'r') restart();
+  if (k === 'm') toMenu();
+  if (k === 'g') ghostOn = !ghostOn;
+  if (k === 'd'){ debug = !debug; H.dbg.hidden = !debug; }
+  if (k >= '1' && k <= '3' && COURSES[k - 1]) selectCourse(COURSES[k - 1]);
+  if (k === '4') mpEnter();
+});
+
+function toMenu(){ state = 'menu'; trail = []; particles = []; H.line3.hidden = false; setMsg(); }
+function selectCourse(c){ course = c; ROOMS = c.rooms; START = c.start; best = loadBest(c); state = 'title'; restart(); }
+function restart(){
+  if (state === 'menu') return;
+  state = 'title'; roomIdx = 0; cp = START; cpsHit = new Set(); deaths = 0; splits = []; elapsed = 0; deathMark = null;
+  gRec = []; gLastT = -1; gi = 0; gTrail = []; trail = []; particles = []; maxSpeed = 0; falseStarts = 0; setMsg();
+}
+function burst(color){
+  for (let i = 0; i < 40; i++){ const a = Math.random() * TAU, v = 120 + Math.random() * 420; particles.push({ x: cur.x, y: cur.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.5 + Math.random() * 0.5, c: i % 3 ? 'haz' : '#fff' }); }
+  for (let i = 0; i < trail.length; i += 2){ const a = Math.random() * TAU, v = 60 + Math.random() * 200; particles.push({ x: trail[i].x, y: trail[i].y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.4 + Math.random() * 0.5, c: color }); }
+  trail = [];
+}
+function die(where){
+  deaths++; state = 'dead'; deathMark = { x: cur.x, y: cur.y, t: elapsed }; burst('#5ee1ff');
+}
+function enterRoom(i){
+  roomIdx = i; cp = roomEntry(i); cpsHit = new Set(); trail = []; gTrail = [];
+}
+function medalFor(c, t){ return t <= c.medals[0] ? 'GOLD' : t <= c.medals[1] ? 'SILVER' : t <= c.medals[2] ? 'BRONZE' : null; }
+function finish(){
+  state = 'done'; finalTime = elapsed; splits.push(elapsed);
+  let isBest = false;
+  if (!best || finalTime < best.time){ isBest = true; best = { time: finalTime, deaths, s: gRec }; try { localStorage.setItem(bestKey(course), JSON.stringify(best)); } catch (e) {} }
+  setMsg(isBest);
+}
+function fmt(t){ return t.toFixed(2); }
+const MEDAL_COLORS = { GOLD: '#ffd044', SILVER: '#cfd8e6', BRONZE: '#d08a4c' };
+function setMsg(isBest){
+  if (state === 'menu') H.msg.innerHTML = '<h1>CURSOR RUN</h1><p>カードをクリックして選択（1 / 2 / 3 / 4 キーでも可）</p>';
+  else if (state === 'title') H.msg.innerHTML = `<h1>${course.name}</h1><p>緑のパッドにカーソルを置くとカウントダウン。壁と赤いものに触れたら直前のパッドへ戻る。部屋の外に出ても死ぬ。</p><p>GOLD ${course.medals[0]}s · SILVER ${course.medals[1]}s · BRONZE ${course.medals[2]}s</p>`;
+  else if (state === 'done'){
+    const rows = splits.map((s, i) => `<span>${ROOMS[i].name}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}</span>`).join('');
+    const m = medalFor(course, finalTime);
+    const medal = m ? `<div class="medal" style="background:${MEDAL_COLORS[m]};color:#111">${m}</div>` : '';
+    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span></div><p>R でリスタート · M でコース選択</p>`;
+  } else H.msg.innerHTML = '';
+}
+setMsg();
+
+// メニューのカード配置（コース3枚＋ONLINE）
+function menuCards(){
+  const items = [...COURSES.map(c => ({ kind: 'course', c })), { kind: 'online' }];
+  const w = 290, h = 230, gap = 30, n = items.length, x0 = (T.W - (n * w + (n - 1) * gap)) / 2, y = 250;
+  return items.map((it, i) => ({ ...it, x: x0 + i * (w + gap), y, w, h }));
+}
+
+// ===================== 更新（シングル） =====================
+let lastNow = performance.now();
+function hazardTime(now){
+  if (state === 'race' || state === 'dead' || state === 'done') return elapsed;
+  if (state === 'count') return 0;
+  return now / 1000; // タイトル中はプレビューで動かす
+}
+function update(now){
+  const dt = Math.min(0.05, (now - lastNow) / 1000); lastNow = now;
+  if (state === 'mp'){ mpUpdate(now, dt); return; }
+  if (state === 'race' || state === 'dead') elapsed = (now - goTime) / 1000;
+  const room = ROOMS[roomIdx], ht = hazardTime(now), ps = state === 'menu' ? [] : prims(room, ht);
+  const prevCur = { x: cur.x, y: cur.y };
+
+  for (const s of samples){
+    if (s.out){ if (state === 'race') die('out'); else if (state === 'count'){ state = 'title'; falseStarts++; flyFlash = 1; setMsg(); } have = false; continue; }
+    have = true;
+    if (state === 'race'){
+      const h = sweepHit(ps, cur.x, cur.y, s.x, s.y);
+      if (h){ cur = s; die(h); continue; }
+    }
+    cur = s;
+    if (state !== 'dead') dropDot(trail, cur.x, cur.y, now);
+    if (state === 'title'){ if (dist(cur, START) < T.PAD_R){ state = 'count'; countEnd = now + T.COUNTDOWN * 1000; setMsg(); } }
+    else if (state === 'count'){ if (dist(cur, START) > T.PAD_R){ state = 'title'; falseStarts++; flyFlash = 1; setMsg(); } }
+    else if (state === 'dead'){ if (dist(cur, cp) < T.PAD_R * 0.8) state = 'race'; }
+  }
+  samples.length = 0;
+  if (state === 'menu'){
+    for (const c of clicks){ for (const card of menuCards()) if (inRect(c, card)){ if (card.kind === 'course') selectCourse(card.c); else mpEnter(); } }
+  }
+  clicks.length = 0;
+  if (state === 'mp'){ draw(now, null, [], 0); return; }
+  speed = dt > 0 ? dist(prevCur, cur) / dt : 0; if (state === 'race') maxSpeed = Math.max(maxSpeed, speed);
+
+  if (state === 'count' && now >= countEnd){ state = 'race'; goTime = now; elapsed = 0; gRec = []; gLastT = -1; gi = 0; gTrail = []; }
+  if (state === 'race' && have){
+    // 静止中に突っ込んでくる障害物
+    const h = sweepHit(ps, cur.x, cur.y, cur.x, cur.y); if (h) die(h);
+  }
+  if (state === 'race'){
+    for (const c of room.cps){ if (dist(cur, c) < T.PAD_R && !cpsHit.has(c)){ cpsHit.add(c); cp = c; } }
+    if (dist(cur, room.exit) < T.PAD_R){
+      if (roomIdx === ROOMS.length - 1) finish(); else { splits.push(elapsed); enterRoom(roomIdx + 1); }
+    }
+  }
+  // ゴースト記録
+  if ((state === 'race' || state === 'dead') && elapsed - gLastT >= 1 / T.GHOST_HZ){ gLastT = elapsed; gRec.push(Math.round(elapsed * 1000), roomIdx, Math.round(cur.x), Math.round(cur.y), state === 'race' ? 1 : 0); }
+
+  pruneTrail(trail, now); pruneTrail(gTrail, now);
+  stepParticles(dt);
+  flyFlash = Math.max(0, flyFlash - dt * 2);
+
+  // HUD
+  const inMenu = state === 'menu';
+  H.time.textContent = inMenu ? '' : fmt(state === 'done' ? finalTime : elapsed);
+  H.room.textContent = inMenu ? '' : `ROOM ${roomIdx + 1}/${ROOMS.length}`; H.name.textContent = inMenu ? '' : `${course.name} · ${room.name}`;
+  H.deaths.textContent = deaths; H.best.textContent = best ? fmt(best.time) : '--';
+  if (debug) H.dbg.textContent = `speed ${Math.round(speed)} px/s · max ${Math.round(maxSpeed)} · false starts ${falseStarts} · state ${state}`;
+  draw(now, room, ps, ht);
+}
+function stepParticles(dt){
+  for (const p of particles){ p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.9; p.vy *= 0.9; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+}
+
+// ===================== マルチプレイ（Ultimate Chicken Horse 方式） =====================
+// サーバー(server.js)がフェーズを進め、クライアントは当たり判定と申告を担当する。
+const MP = { ws: null, id: null, offset: 0, snap: null, me: null, others: {}, status: 'idle', posT: 0, note: '', noteT: 0 };
+const MP_START = { x: 90, y: 360 }, MP_GOAL = { x: 1190, y: 360 };
+const PHASE_LABEL = { lobby: 'LOBBY', box: 'ピースを選べ', place: '設置せよ', count: 'スタートパッドに乗れ', run: 'GO', results: 'RESULT', final: 'WINNER' };
+function myName(){
+  const u = new URLSearchParams(location.search).get('name'); if (u) return u.slice(0, 12);
+  let n = null; try { n = localStorage.getItem('cursorrun.name'); } catch (e) {}
+  if (!n){ const L = ['ひよこ', 'うま', 'ねこ', 'いぬ', 'かえる', 'さる', 'きつね', 'くま']; n = L[Math.floor(Math.random() * L.length)] + Math.floor(10 + Math.random() * 90); try { localStorage.setItem('cursorrun.name', n); } catch (e) {} }
+  return n;
+}
+function mpNote(s, ms){ MP.note = s; MP.noteT = ms === Infinity ? Infinity : performance.now() + (ms || 2000); }
+function mpSend(o){ if (MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify(o)); }
+function serverNow(){ return Date.now() + MP.offset; }
+function mpEnter(){
+  state = 'mp'; trail = []; particles = []; deaths = 0; MP.snap = null; MP.me = null; MP.others = {}; MP.status = 'idle'; H.line3.hidden = true; setMsg();
+  if (!/^https?:$/.test(location.protocol)){ mpNote('ONLINE は node server.js で起動した http://localhost:8080 で開くと遊べます（M でメニュー）', Infinity); return; }
+  mpNote('接続中…', Infinity);
+  try {
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host); MP.ws = ws;
+    ws.onopen = () => { mpNote('', 0); ws.send(JSON.stringify({ t: 'join', room: new URLSearchParams(location.search).get('room') || 'main', name: myName() })); };
+    ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch (err) { return; } mpMsg(m); };
+    ws.onerror = () => mpNote('サーバーに接続できません。node server.js で起動したURLで開いてください（M でメニュー）', Infinity);
+    ws.onclose = () => { MP.ws = null; if (state === 'mp' && MP.snap) mpNote('切断されました（M でメニュー）', Infinity); };
+  } catch (e) { mpNote('WebSocket を開けません（M でメニュー）', Infinity); }
+}
+function mpLeave(){ if (MP.ws){ MP.ws.onclose = null; MP.ws.close(); MP.ws = null; } toMenu(); }
+function mpMsg(m){
+  if (m.t === 'hello'){ MP.id = m.id; MP.offset = m.now - Date.now(); }
+  else if (m.t === 'state'){
+    MP.offset = m.now - Date.now();
+    const prev = MP.snap; MP.snap = m; MP.me = m.players.find(p => p.id === MP.id) || null;
+    if (!prev || prev.phase !== m.phase){
+      if (m.phase === 'count'){ MP.status = 'waiting'; trail = []; particles = []; }
+      if (m.phase === 'box' || m.phase === 'lobby') MP.status = 'idle';
+      if (m.phase === 'results' || m.phase === 'final') for (const id in MP.others) MP.others[id].trail = [];
+    }
+    for (const id in MP.others) if (!m.players.some(p => p.id === id)) delete MP.others[id];
+  }
+  else if (m.t === 'pos'){ const o = MP.others[m.id] || (MP.others[m.id] = { x: m.x, y: m.y, trail: [] }); o.x = m.x; o.y = m.y; dropDot(o.trail, m.x, m.y, performance.now()); }
+  else if (m.t === 'reject') mpNote('そこには置けない');
+  else if (m.t === 'full') mpNote('部屋が満員です（M でメニュー）', Infinity);
+}
+function mpKeyReady(){ if (MP.snap && MP.snap.phase === 'lobby') mpSend({ t: 'ready' }); }
+function mpKeyPass(){ if (MP.snap && MP.snap.phase === 'place' && MP.me && !MP.me.placed) mpSend({ t: 'pass' }); }
+function mpHazardTime(){
+  const s = MP.snap; if (!s) return 0;
+  if (s.phase === 'count') return 0;
+  if (s.phase === 'run' || s.phase === 'results' || s.phase === 'final') return Math.max(0, (serverNow() - s.runStart) / 1000);
+  return serverNow() / 1000; // 設置中はサーバー時刻で同期したプレビュー
+}
+function mpDie(h){
+  MP.status = 'dead'; deaths++;
+  mpSend({ t: 'dead', by: h && h.src && h.src.owner ? h.src.owner : null });
+  burst(MP.me ? MP.me.color : '#5ee1ff');
+}
+const mpReadyBtn = () => ({ x: 540, y: 600, w: 200, h: 60 });
+function mpBoxCards(){
+  const s = MP.snap, n = s.box.length, gap = 20, w = Math.min(200, (T.W - 80 - (n - 1) * gap) / n), h = 170, x0 = (T.W - (n * w + (n - 1) * gap)) / 2, y = 290;
+  return s.box.map((b, i) => ({ x: x0 + i * (w + gap), y, w, h }));
+}
+function mpUpdate(now, dt){
+  const s = MP.snap, phase = s ? s.phase : 'connecting', ht = mpHazardTime();
+  const level = s ? s.level : [], ps = prims({ pieces: level }, ht);
+  const racing = phase === 'run' && MP.status === 'running';
+  for (const smp of samples){
+    if (smp.out){ if (racing) mpDie(null); have = false; continue; }
+    have = true;
+    if (phase === 'run' && MP.status === 'running'){ const h = sweepHit(ps, cur.x, cur.y, smp.x, smp.y); if (h){ cur = smp; mpDie(h); continue; } }
+    cur = smp; if (MP.status !== 'dead') dropDot(trail, cur.x, cur.y, now);
+  }
+  samples.length = 0;
+  if (phase === 'run' && MP.status === 'running' && have){ const h = sweepHit(ps, cur.x, cur.y, cur.x, cur.y); if (h) mpDie(h); }
+  if (phase === 'run' && MP.status === 'waiting' && have && dist(cur, MP_START) < T.PAD_R){ MP.status = 'running'; mpSend({ t: 'start' }); }
+  if (phase === 'run' && MP.status === 'running' && dist(cur, MP_GOAL) < T.PAD_R){ MP.status = 'finished'; mpSend({ t: 'finish' }); }
+  for (const c of clicks){
+    if (!s) continue;
+    if (phase === 'lobby'){ if (inRect(c, mpReadyBtn())) mpSend({ t: 'ready' }); }
+    else if (phase === 'box' && MP.me && MP.me.pick === null){ mpBoxCards().forEach((card, i) => { if (inRect(c, card) && s.box[i].takenBy === null) mpSend({ t: 'pick', i }); }); }
+    else if (phase === 'place' && MP.me && MP.me.pick !== null && !MP.me.placed){
+      const rel = s.box[MP.me.pick].piece;
+      if (placementOk(rel, c.x, c.y, MP_START, MP_GOAL)) mpSend({ t: 'place', x: Math.round(c.x), y: Math.round(c.y) }); else mpNote('そこには置けない');
+    }
+  }
+  clicks.length = 0;
+  if (have && now - MP.posT > 1000 / T.POS_HZ){ MP.posT = now; mpSend({ t: 'pos', x: Math.round(cur.x), y: Math.round(cur.y) }); }
+  pruneTrail(trail, now); for (const id in MP.others) pruneTrail(MP.others[id].trail, now);
+  stepParticles(dt);
+  // HUD
+  const left = s ? Math.max(0, (s.deadline - serverNow()) / 1000) : 0;
+  H.time.textContent = !s ? '' : phase === 'run' ? fmt(Math.max(0, (serverNow() - s.runStart) / 1000)) : phase === 'count' ? Math.ceil(left) + '' : left.toFixed(0);
+  H.room.textContent = s ? `ROUND ${s.round}` : 'ONLINE'; H.name.textContent = s && MP.me ? `${MP.me.name} · ${MP.me.score} / ${s.target} pt` : '';
+  if (debug) H.dbg.textContent = `phase ${phase} · status ${MP.status} · offset ${Math.round(MP.offset)}ms`;
+  draw(now, null, ps, ht, level);
+}
+
+// ===================== 描画 =====================
+function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+const C = {};
+function cacheColors(){ for (const n of ['arena','grid','wall','wall-edge','haz','laser','start','cp','exit','player','ghost','dim','fg','card','card-hi']) C[n] = css('--' + n); }
+cacheColors();
+
+function pad(x, y, r, color, label, strong){
+  ctx.save();
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = color; ctx.globalAlpha = strong ? 0.28 : 0.1; ctx.fill();
+  ctx.globalAlpha = strong ? 1 : 0.5; ctx.lineWidth = 3; ctx.strokeStyle = color; ctx.stroke();
+  if (label){ ctx.globalAlpha = strong ? 1 : 0.6; ctx.fillStyle = color; ctx.font = '700 13px ' + css('--font'); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, x, y); }
+  ctx.restore();
+}
+function goal(x, y, r){
+  ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.clip();
+  const n = 8, s = (r * 2) / n;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++){ ctx.fillStyle = (i + j) % 2 ? '#f2f4f8' : '#1a1f2c'; ctx.fillRect(x - r + i * s, y - r + j * s, s, s); }
+  ctx.restore(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.lineWidth = 3; ctx.strokeStyle = C.exit; ctx.stroke();
+}
+function drawTrail(tr, color, alpha, now){
+  if (!tr.length) return;
+  ctx.save(); ctx.fillStyle = color;
+  for (const d of tr){
+    const f = 1 - (now - d.t) / (T.TRAIL_LIFE * 1000); if (f <= 0) continue;
+    ctx.globalAlpha = alpha * f; ctx.beginPath(); ctx.arc(d.x, d.y, T.TRAIL_R * (0.3 + 0.7 * f), 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+function head(x, y, color, alpha, hollow){
+  ctx.save(); ctx.globalAlpha = alpha;
+  ctx.shadowColor = color; ctx.shadowBlur = hollow ? 0 : 18;
+  ctx.beginPath(); ctx.arc(x, y, 8, 0, TAU);
+  if (hollow){ ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.setLineDash([3, 3]); ctx.stroke(); }
+  else { ctx.fillStyle = color; ctx.fill(); ctx.shadowBlur = 0; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill(); }
+  ctx.restore();
+}
+function ghostPose(){
+  if (!best || !ghostOn || !(state === 'race' || state === 'dead')) return null;
+  const s = best.s, n = s.length / 5, ms = elapsed * 1000;
+  while (gi + 1 < n && s[(gi + 1) * 5] <= ms) gi++;
+  if (gi >= n) return null;
+  const a = gi * 5, b = Math.min(n - 1, gi + 1) * 5;
+  if (s[a + 1] !== roomIdx) return { room: s[a + 1] };
+  let x = s[a + 2], y = s[a + 3];
+  if (s[b + 1] === roomIdx && s[b] > s[a]){ const u = Math.min(1, (ms - s[a]) / (s[b] - s[a])); x += (s[b + 2] - x) * u; y += (s[b + 3] - y) * u; }
+  return { room: roomIdx, x, y, alive: s[a + 4] === 1 };
+}
+function text(str, x, y, size, color, align, weight){
+  ctx.fillStyle = color; ctx.font = `${weight || 700} ${size}px ${css('--font')}`; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle'; ctx.fillText(str, x, y);
+}
+function drawMenu(now){
+  text('CURSOR RUN', T.W / 2, 130, 56, C.fg, 'center');
+  for (const card of menuCards()){
+    const hover = have && inRect(cur, card);
+    ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2;
+    ctx.beginPath(); ctx.roundRect(card.x, card.y, card.w, card.h, 10); ctx.fill(); ctx.stroke();
+    if (card.kind === 'course'){
+      const c = card.c, b = loadBest(c), m = b ? medalFor(c, b.time) : null;
+      text(c.name, card.x + 24, card.y + 44, 32, C.fg);
+      text(c.desc, card.x + 24, card.y + 84, 15, C.dim, 'left', 500);
+      text(`${c.rooms.length} ROOMS`, card.x + 24, card.y + 120, 14, C.dim, 'left', 500);
+      text('BEST ' + (b ? fmt(b.time) : '--'), card.x + 24, card.y + 160, 18, m ? MEDAL_COLORS[m] : C.fg);
+      text(`${c.medals[0]} / ${c.medals[1]} / ${c.medals[2]} s`, card.x + 24, card.y + 194, 13, C.dim, 'left', 500);
+    } else {
+      text('ONLINE', card.x + 24, card.y + 44, 32, C.start);
+      text('みんなでコースを作る対戦', card.x + 24, card.y + 84, 15, C.dim, 'left', 500);
+      text('箱から選ぶ → 置く → 走る', card.x + 24, card.y + 110, 14, C.dim, 'left', 500);
+      text('先に15点で勝ち', card.x + 24, card.y + 134, 14, C.dim, 'left', 500);
+      text('名前 ' + myName(), card.x + 24, card.y + 170, 16, C.fg);
+      text('node server.js で起動', card.x + 24, card.y + 200, 12, C.dim, 'left', 500);
+    }
+  }
+}
+// ピース群の描画（ガイド → 本体 → 砲台の台座）
+function drawPieces(pieces, ps){
+  ctx.save(); ctx.strokeStyle = C.haz; ctx.fillStyle = C.haz;
+  for (const p of pieces){
+    if (p.t === 'orbit'){ ctx.beginPath(); ctx.arc(p.x, p.y, p.R, 0, TAU); ctx.globalAlpha = 0.18; ctx.setLineDash([6, 8]); ctx.stroke(); ctx.setLineDash([]); }
+    if (p.t === 'slider'){ ctx.globalAlpha = 0.06; ctx.fillRect(p.x + Math.min(0, p.dx || 0), p.y + Math.min(0, p.dy || 0), p.w + Math.abs(p.dx || 0), p.h + Math.abs(p.dy || 0)); }
+    if (p.t === 'pulser'){ ctx.beginPath(); ctx.arc(p.x, p.y, p.rmax, 0, TAU); ctx.globalAlpha = 0.15; ctx.setLineDash([4, 6]); ctx.stroke(); ctx.setLineDash([]); }
+    if (p.t === 'shooter'){ ctx.globalAlpha = 0.12; ctx.setLineDash([4, 10]); ctx.lineWidth = p.r * 2; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + p.dx * p.range, p.y + p.dy * p.range); ctx.stroke(); ctx.setLineDash([]); ctx.lineWidth = 1; }
+    if (p.t === 'bar' && p.anchor === 'end'){ ctx.beginPath(); ctx.arc(p.x, p.y, p.len, 0, TAU); ctx.globalAlpha = 0.1; ctx.setLineDash([6, 8]); ctx.stroke(); ctx.setLineDash([]); }
+  }
+  ctx.restore();
+  for (const pr of ps){
+    if (pr.k === 'rect'){
+      if (pr.c === 'wall'){ ctx.fillStyle = C.wall; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.strokeRect(pr.x + 1, pr.y + 1, pr.w - 2, pr.h - 2); }
+      else if (pr.c === 'blink'){
+        if (pr.on){ ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 12; ctx.fillStyle = C.haz; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.restore(); }
+        else { ctx.save(); ctx.globalAlpha = 0.25; ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.setLineDash([4, 6]); ctx.strokeRect(pr.x, pr.y, pr.w, pr.h); ctx.restore(); }
+      }
+      else { ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.fillStyle = C.haz; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.restore(); }
+    } else if (pr.k === 'circ'){
+      ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.beginPath(); ctx.arc(pr.x, pr.y, pr.r, 0, TAU); ctx.fillStyle = C.haz; ctx.fill(); ctx.restore();
+    } else if (pr.k === 'cap'){
+      ctx.save(); ctx.lineCap = 'round';
+      if (pr.c === 'laser'){
+        if (pr.on){ ctx.shadowColor = C.laser; ctx.shadowBlur = 16; ctx.strokeStyle = C.laser; ctx.lineWidth = pr.r * 2; }
+        else { ctx.strokeStyle = C.laser; ctx.globalAlpha = 0.25; ctx.lineWidth = 2; ctx.setLineDash([4, 8]); }
+      } else { ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.strokeStyle = C.haz; ctx.lineWidth = pr.r * 2; }
+      ctx.beginPath(); ctx.moveTo(pr.ax, pr.ay); ctx.lineTo(pr.bx, pr.by); ctx.stroke(); ctx.restore();
+      if (pr.src && pr.src.t === 'bar'){ ctx.beginPath(); ctx.arc(pr.src.x, pr.src.y, pr.r + 4, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.stroke(); }
+    }
+  }
+  for (const p of pieces) if (p.t === 'shooter'){ ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 6, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 3; ctx.stroke(); }
+}
+function pieceAnchor(p){ return p.t === 'gate' ? { x: (p.ax + p.bx) / 2, y: (p.ay + p.by) / 2 } : { x: p.x + (p.w ? p.w / 2 : 0), y: p.y + (p.h ? p.h / 2 : 0) }; }
+
+function drawSingle(now, room, ps){
+  if (flyFlash > 0){ ctx.fillStyle = C.haz; ctx.globalAlpha = flyFlash * 0.25; ctx.fillRect(0, 0, T.W, T.H); ctx.globalAlpha = 1; }
+  const entry = roomEntry(roomIdx);
+  if (roomIdx === 0) pad(START.x, START.y, T.PAD_R, C.start, state === 'count' ? Math.ceil((countEnd - now) / 1000) + '' : 'START', state !== 'race');
+  else pad(entry.x, entry.y, T.PAD_R, C.cp, 'IN', cp === entry);
+  for (const c of room.cps) pad(c.x, c.y, T.PAD_R, C.cp, 'CP', cp === c);
+  if (roomIdx === ROOMS.length - 1) goal(room.exit.x, room.exit.y, T.PAD_R); else pad(room.exit.x, room.exit.y, T.PAD_R, C.exit, 'EXIT', true);
+  if (state === 'dead'){ // 戻り先を強調
+    const pulse = 0.5 + 0.5 * Math.sin(now / 120);
+    ctx.beginPath(); ctx.arc(cp.x, cp.y, T.PAD_R + 6 + pulse * 10, 0, TAU); ctx.strokeStyle = C.cp; ctx.lineWidth = 2; ctx.globalAlpha = 0.6 + 0.4 * pulse; ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  drawPieces(room.pieces, ps);
+  const g = ghostPose();
+  if (g && g.room === roomIdx){
+    if (g.alive) dropDot(gTrail, g.x, g.y, now);
+    drawTrail(gTrail, C.ghost, 0.5, now); head(g.x, g.y, C.ghost, 0.6, !g.alive);
+  } else gTrail = [];
+  if (deathMark && state === 'dead'){ ctx.beginPath(); ctx.moveTo(deathMark.x - 9, deathMark.y - 9); ctx.lineTo(deathMark.x + 9, deathMark.y + 9); ctx.moveTo(deathMark.x + 9, deathMark.y - 9); ctx.lineTo(deathMark.x - 9, deathMark.y + 9); ctx.strokeStyle = C.haz; ctx.lineWidth = 3; ctx.stroke(); }
+  drawParticles();
+  drawTrail(trail, C.player, 0.9, now);
+  if (have){
+    head(cur.x, cur.y, state === 'dead' ? C.ghost : C.player, 1, state === 'dead');
+    if (debug){ ctx.beginPath(); ctx.arc(cur.x, cur.y, T.HEAD_R, 0, TAU); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
+  }
+}
+function drawParticles(){
+  for (const p of particles){ ctx.globalAlpha = Math.min(1, p.life * 2); ctx.fillStyle = p.c === 'haz' ? C.haz : p.c; ctx.fillRect(p.x - 2, p.y - 2, 4, 4); }
+  ctx.globalAlpha = 1;
+}
+function panel(x, y, w, h){ ctx.fillStyle = 'rgba(7,9,15,0.82)'; ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke(); }
+function drawMulti(now, ps, ht, level){
+  const s = MP.snap, phase = s ? s.phase : 'connecting', pl = s ? s.players : [], colorOf = id => (pl.find(p => p.id === id) || {}).color || C.ghost;
+  const myColor = MP.me ? MP.me.color : C.player;
+  if (s && phase !== 'lobby'){
+    pad(MP_START.x, MP_START.y, T.PAD_R, C.start, phase === 'count' ? Math.ceil(Math.max(0, (s.deadline - serverNow()) / 1000)) + '' : 'START', phase === 'count' || phase === 'run');
+    goal(MP_GOAL.x, MP_GOAL.y, T.PAD_R);
+    drawPieces(level, ps);
+    for (const p of level) if (p.owner){ const a = pieceAnchor(p); ctx.beginPath(); ctx.arc(a.x, a.y, 5, 0, TAU); ctx.fillStyle = colorOf(p.owner); ctx.fill(); }
+    // 設置プレビュー
+    if (phase === 'place' && MP.me && MP.me.pick !== null && !MP.me.placed && have){
+      const rel = s.box[MP.me.pick].piece, ok = placementOk(rel, cur.x, cur.y, MP_START, MP_GOAL), piece = translate(rel, cur.x, cur.y), b = bounds(piece);
+      ctx.save(); ctx.globalAlpha = 0.75; drawPieces([piece], prims({ pieces: [piece] }, ht)); ctx.restore();
+      ctx.strokeStyle = ok ? C.start : C.haz; ctx.lineWidth = 2; ctx.setLineDash([6, 6]); ctx.strokeRect(b.x, b.y, b.w, b.h); ctx.setLineDash([]);
+    }
+    // 他プレイヤー
+    for (const p of pl){ if (p.id === MP.id) continue; const o = MP.others[p.id]; if (!o) continue;
+      const out = p.status === 'dead' || p.status === 'out';
+      drawTrail(o.trail, p.color, 0.6, now); head(o.x, o.y, p.color, out ? 0.5 : 0.9, out);
+      text(p.name, o.x, o.y - 18, 12, p.color, 'center', 500);
+    }
+  }
+  drawParticles();
+  drawTrail(trail, myColor, 0.9, now);
+  if (have && phase !== 'connecting') head(cur.x, cur.y, MP.status === 'dead' ? C.ghost : myColor, 1, MP.status === 'dead');
+  // バナー
+  if (s){
+    const left = Math.max(0, (s.deadline - serverNow()) / 1000);
+    if (phase !== 'lobby' && phase !== 'results' && phase !== 'final'){
+      text(PHASE_LABEL[phase] || phase, T.W / 2, 34, 26, C.fg, 'center');
+      if (phase === 'box' || phase === 'place') text(left.toFixed(0) + 's', T.W / 2, 64, 18, C.dim, 'center', 500);
+      if (phase === 'run'){ const st = MP.status === 'dead' ? 'DEAD' : MP.status === 'finished' ? 'FINISH!' : MP.status === 'waiting' ? 'スタートパッドへ' : ''; if (st) text(st, T.W / 2, 64, 18, MP.status === 'dead' ? C.haz : C.start, 'center'); }
+      if (phase === 'place') text(MP.me && MP.me.placed ? '他のプレイヤーを待っています' : 'クリックで設置 · Space で捨てる', T.W / 2, T.H - 24, 14, C.dim, 'center', 500);
+    }
+    // スコアボード
+    const sb = { x: T.W - 230, y: 60, w: 216, h: 24 + pl.length * 26 };
+    panel(sb.x, sb.y, sb.w, sb.h);
+    pl.slice().sort((a, b) => b.score - a.score).forEach((p, i) => {
+      const y = sb.y + 24 + i * 26, mark = phase === 'lobby' ? (p.ready ? '✓' : '…') : phase === 'box' ? (p.pick !== null ? '✓' : '…') : phase === 'place' ? (p.placed ? '✓' : '…') : (phase === 'run' || phase === 'count') ? ({ waiting: '…', running: '▶', dead: '✕', finished: '★', out: '－' }[p.status] || '') : '';
+      ctx.beginPath(); ctx.arc(sb.x + 18, y, 6, 0, TAU); ctx.fillStyle = p.color; ctx.fill();
+      text(p.name + (p.id === MP.id ? ' (you)' : ''), sb.x + 32, y, 14, C.fg, 'left', 500);
+      text(mark, sb.x + sb.w - 56, y, 14, C.dim, 'center');
+      text(p.score + '', sb.x + sb.w - 16, y, 16, C.exit, 'right');
+    });
+    if (phase === 'lobby'){
+      text('ONLINE LOBBY', T.W / 2, 150, 44, C.fg, 'center');
+      text(`部屋 ${s.code} · このURLを共有して集まる · 先に ${s.target} 点で勝ち`, T.W / 2, 205, 16, C.dim, 'center', 500);
+      text('毎ラウンド: 箱からピースを早い者勝ちで選ぶ → 全員同時に設置 → 全員同時に走る', T.W / 2, 235, 15, C.dim, 'center', 500);
+      text('ゴール +2 · 1着 +1 · 単独ゴール +2 · 自分のピースで倒す +1 · 全員ゴールなら無得点', T.W / 2, 262, 15, C.dim, 'center', 500);
+      pl.forEach((p, i) => { const y = 330 + i * 34; ctx.beginPath(); ctx.arc(T.W / 2 - 120, y, 8, 0, TAU); ctx.fillStyle = p.color; ctx.fill(); text(p.name, T.W / 2 - 100, y, 20, C.fg); text(p.ready ? 'READY' : '', T.W / 2 + 60, y, 16, C.start); });
+      const b = mpReadyBtn(), hover = have && inRect(cur, b), ready = MP.me && MP.me.ready;
+      ctx.fillStyle = ready ? C.start : (hover ? C['card-hi'] : C.card); ctx.strokeStyle = C.start; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 10); ctx.fill(); ctx.stroke();
+      text(ready ? 'READY ✓' : 'READY', b.x + b.w / 2, b.y + b.h / 2, 22, ready ? '#111' : C.fg, 'center');
+      text('Enter でも可 · 全員 READY で開始', T.W / 2, 690, 13, C.dim, 'center', 500);
+    }
+    if (phase === 'box'){
+      mpBoxCards().forEach((card, i) => {
+        const b = s.box[i], taken = b.takenBy !== null, mine = b.takenBy === MP.id, hover = have && inRect(cur, card) && !taken;
+        ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = mine ? C.start : taken ? colorOf(b.takenBy) : hover ? C.player : C['wall-edge']; ctx.lineWidth = taken || hover ? 3 : 2;
+        ctx.beginPath(); ctx.roundRect(card.x, card.y, card.w, card.h, 10); ctx.fill(); ctx.stroke();
+        text(b.name, card.x + card.w / 2, card.y + 22, 15, taken ? C.dim : C.fg, 'center');
+        // ミニプレビュー
+        const bb = bounds(b.piece), sc = Math.min(0.32, (card.w - 30) / Math.max(1, bb.w), (card.h - 70) / Math.max(1, bb.h));
+        ctx.save(); ctx.translate(card.x + card.w / 2, card.y + 42 + (card.h - 70) / 2); ctx.scale(sc, sc); ctx.translate(-(bb.x + bb.w / 2), -(bb.y + bb.h / 2));
+        if (taken) ctx.globalAlpha = 0.35; drawPieces([b.piece], prims({ pieces: [b.piece] }, ht)); ctx.restore();
+        if (taken) text((pl.find(p => p.id === b.takenBy) || {}).name || '', card.x + card.w / 2, card.y + card.h - 14, 12, colorOf(b.takenBy), 'center', 500);
+      });
+    }
+    if (phase === 'results' && s.results){
+      const r = s.results, w = 640, h = 90 + r.rows.length * 34; panel((T.W - w) / 2, 110, w, h);
+      text(r.everyone ? '全員ゴール：無得点' : 'RESULT', T.W / 2, 140, 24, C.fg, 'center');
+      r.rows.forEach((row, i) => { const y = 190 + i * 34, x0 = (T.W - w) / 2 + 24;
+        ctx.beginPath(); ctx.arc(x0 + 8, y, 7, 0, TAU); ctx.fillStyle = row.color; ctx.fill();
+        text(row.name, x0 + 26, y, 18, C.fg);
+        text(row.status === 'finished' ? fmt(row.finishTime / 1000) + 's' : row.status === 'dead' ? '死亡' : '未ゴール', x0 + 200, y, 15, C.dim, 'left', 500);
+        text(row.notes.join('  '), x0 + 320, y, 13, C.dim, 'left', 500);
+        text((row.pts ? '+' + row.pts : '0') + ' → ' + row.score, x0 + w - 48, y, 18, C.exit, 'right'); });
+    }
+    if (phase === 'final' && s.winner){ panel(T.W / 2 - 260, 240, 520, 160); text('WINNER', T.W / 2, 290, 28, C.dim, 'center'); text(s.winner.name, T.W / 2, 345, 48, s.winner.color, 'center'); }
+  }
+  if (MP.note && performance.now() < MP.noteT){ panel(T.W / 2 - 360, T.H - 90, 720, 44); text(MP.note, T.W / 2, T.H - 68, 15, C.fg, 'center', 500); }
+}
+
+function draw(now, room, ps, ht, level){
+  const { s, ox, oy, dpr } = view;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cvs.width, cvs.height);
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, ox * dpr, oy * dpr);
+  // arena
+  ctx.fillStyle = C.arena; ctx.fillRect(0, 0, T.W, T.H);
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = 80; x < T.W; x += 80){ ctx.moveTo(x, 0); ctx.lineTo(x, T.H); }
+  for (let y = 80; y < T.H; y += 80){ ctx.moveTo(0, y); ctx.lineTo(T.W, y); }
+  ctx.stroke();
+  if (state === 'menu'){ drawMenu(now); drawTrail(trail, C.player, 0.9, now); if (have) head(cur.x, cur.y, C.player, 1, false); }
+  else if (state === 'mp') drawMulti(now, ps, ht, level || []);
+  else drawSingle(now, room, ps);
+  // レターボックス外を暗く
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#07090f';
+  if (ox > 0){ ctx.fillRect(0, 0, ox, cvs.height); ctx.fillRect(ox + T.W * s, 0, ox + 1, cvs.height); }
+  if (oy > 0){ ctx.fillRect(0, 0, cvs.width, oy); ctx.fillRect(0, oy + T.H * s, cvs.width, oy + 1); }
+}
+
+if (!ctx.roundRect) ctx.roundRect = function(x, y, w, h, r){ this.moveTo(x + r, y); this.arcTo(x + w, y, x + w, y + h, r); this.arcTo(x + w, y + h, x, y + h, r); this.arcTo(x, y + h, x, y, r); this.arcTo(x, y, x + w, y, r); this.closePath(); };
+function loop(now){ try { update(now); } catch (e) { console.error(e); } requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
