@@ -7,6 +7,7 @@ const { load } = require('./harness.js');
 const DAYS = +(process.argv[2] || 120), FROM = '2026-11-23';
 let fail = 0; const ok = (c, msg) => { if (!c){ fail++; console.log('  NG', msg); } return c; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const RIM = [[0, 0], ...Array.from({ length: 16 }, (_, i) => [Math.cos(i / 16 * Math.PI * 2), Math.sin(i / 16 * Math.PI * 2)])]; // パッドの中心と縁16点
 
 (async () => {
   const names = ['COURSES', 'T', 'SV', 'DAILY', 'DAILIES', 'BOARD', 'NET', 'WATCH', 'ME', 'prims', 'hit', 'solveRoom', 'padSafe', 'buildDaily', 'ensureDaily', 'dayShift', 'dayNum', 'dayKeyAt', 'today', 'encodeGhost', 'decodeGhost',
@@ -26,9 +27,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const date = m.dayShift(FROM, i), s = Date.now(), c = m.buildDaily(date); slow = Math.max(slow, Date.now() - s);
     fb += c.daily.fallbacks; parMin = Math.min(parMin, c.par); parMax = Math.max(parMax, c.par); if (i < 40) courses.push(c);
     ok(c.rooms.length === m.DAILY.ROOMS && c.medals[0] < c.medals[1] && c.medals[1] < c.medals[2], date + ' 形がおかしい');
-    // パッドの安全を、生成時とは別の方法（時刻を回して実際の当たり判定）で確かめる
+    // パッドの安全を、生成時とは別の方法で確かめる: 時刻を回し、パッドの中心と縁に置いたカーソルが実際の当たり判定で当たらないこと
     c.rooms.forEach((room, ri) => { const pads = [ri ? c.rooms[ri - 1].exit : c.start, room.exit, ...room.cps];
-      for (let t = 0; t < 24; t += 0.05){ const ps = m.prims(room, t); for (const p of pads) for (const pr of ps) if (m.hit(pr, p.x, p.y, p.x, p.y, m.T.PAD_R)) padBad++; } });
+      for (let t = 0; t < 24; t += 0.05){ const ps = m.prims(room, t); for (const p of pads) for (const [ox, oy] of RIM){ const x = p.x + ox * m.T.PAD_R, y = p.y + oy * m.T.PAD_R; for (const pr of ps) if (m.hit(pr, x, y, x, y, m.T.HEAD_R)) padBad++; } } });
   }
   ok(fb === 0, `予備部屋が ${fb} 回出た`); ok(padBad === 0, `パッドに障害物が ${padBad} 回かかった`);
   console.log(`   予備部屋 ${fb} / パッド接触 ${padBad} / 最大生成時間 ${slow}ms / BOTパー ${parMin.toFixed(1)}〜${parMax.toFixed(1)}s`);

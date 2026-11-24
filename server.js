@@ -53,7 +53,7 @@ const TEMPLATES = [
   { name: '追跡者', make: () => ({ t: 'chaser', x: 0, y: 0, speed: 170, r: 18 }) },
   { name: '自分の影', make: () => ({ t: 'shadow', x: 0, y: 0, delay: 1.5, r: 10 }) },
   // --- 2026-11-23: 画面を端から端まで貫くレーザー。照射中は画面が揺れる（揺れは見た目だけ）---
-  { name: '横断レーザー', make: () => ({ t: 'beam', x: 0, y: 0, deg: [0, 90, 45, 135][Math.floor(Math.random() * 4)], thick: 14, warn: 0.8, on: 0.8, off: rnd(1.4, 2.2), phase: Math.random() }) },
+  { name: '横断レーザー', make: () => ({ t: 'beam', x: 0, y: 0, deg: [0, 90, 45, 135][Math.floor(Math.random() * 4)], thick: 84, warn: 0.8, on: 0.8, off: rnd(1.4, 2.2), phase: Math.random() }) },
   { name: '速度制限区画', sizable: true, make: () => ({ t: 'speedzone', x: 0, y: 0, w: 240, h: 180, limit: 400 }) },
   { name: '停止禁止区画', sizable: true, make: () => ({ t: 'nostop', x: 0, y: 0, w: 240, h: 180, min: 150, grace: 0.5 }) },
 ];
