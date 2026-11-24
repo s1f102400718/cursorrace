@@ -54,6 +54,19 @@ const TEMPLATES = [
   { name: '自分の影', make: () => ({ t: 'shadow', x: 0, y: 0, delay: 1.5, r: 10 }) },
   // --- 2026-11-23: 画面を端から端まで貫くレーザー。照射中は画面が揺れる（揺れは見た目だけ）---
   { name: '横断レーザー', make: () => ({ t: 'beam', x: 0, y: 0, deg: [0, 90, 45, 135][Math.floor(Math.random() * 4)], thick: 84, warn: 0.8, on: 0.8, off: rnd(1.4, 2.2), phase: Math.random() }) },
+  // --- 2026-11-24: 第2弾（図鑑の残り＋新案）。どれも時刻だけで動くので、位置の同期は要らない ---
+  { name: 'リング弾幕', make: () => ({ t: 'danmaku', x: 0, y: 0, pattern: 'ring', n: 16, speed: 150, interval: rnd(0.8, 1.1), r: 6, spin: sign() * rnd(5, 9), life: 2.2, phase: Math.random() }) },
+  { name: '渦巻き', make: () => ({ t: 'danmaku', x: 0, y: 0, pattern: 'ring', n: 3, speed: 170, interval: 0.08, r: 5, spin: sign() * 11, life: 1.8, phase: Math.random() }) },
+  { name: '扇の掃射', make: () => ({ t: 'danmaku', x: 0, y: 0, pattern: 'fan', n: 5, spread: 40, aim: Math.floor(Math.random() * 360), speed: 240, interval: 0.3, r: 6, spin: sign() * 6, life: 1.6, phase: Math.random() }) },
+  { name: '炸裂弾', make: () => ({ t: 'burst', x: 0, y: 0, aim: Math.floor(Math.random() * 360), spin: 47, interval: 1.2, speed: 140, fuse: 1.0, m: 10, speed2: 160, life2: 1.2, r: 9, r2: 5 }) },
+  { name: '反射弾', make: () => ({ t: 'bounce', x: 0, y: 0, n: 5, speed: 200, interval: 2.2, r: 7, life: 4, spin: 20, box: [190, 20, 1090, 700] }) },
+  { name: '跳ねるボール', make: () => { const a = (Math.floor(Math.random() * 4) * 90 + rnd(25, 65)) * Math.PI / 180; return { t: 'ball', x: 0, y: 0, vx: Math.round(Math.cos(a) * 280), vy: Math.round(Math.sin(a) * 280), r: 28, box: [190, 20, 1090, 700] }; } },
+  { name: '巡回ブロック', make: () => ({ t: 'patrol', pts: [[-150, -100], [150, -100], [150, 100], [-150, 100]], speed: sign() * rnd(260, 360), w: 54, h: 54, phase: Math.random() }) },
+  { name: '列車', make: () => ({ t: 'train', x: 0, y: 0, R: 130, cars: 5, size: 38, rpm: sign() * rnd(20, 28), spacing: 20, phase: Math.random() }) },
+  { name: '蛇', make: () => ({ t: 'serpent', vert: true, x: 0, y: 0, amp: 80, wave: 360, speed: sign() * rnd(220, 300), segs: 13, gap: 24, r: 14 }) },
+  { name: '呼吸ブロック', make: () => ({ t: 'breathe', x: 0, y: 0, w: 200, h: 320, period: rnd(1.8, 2.6), min: 0.15, phase: Math.random() }) },
+  { name: 'レーザー順送り', make: () => ({ t: 'seq', x: -160, y: -200, w: 320, h: 400, lines: 4, slot: 0.35, on: 0.28, thick: 10, phase: Math.random() }) },
+  { name: '回る輪', make: () => ({ t: 'ringwall', x: 0, y: 0, R: 130, thick: 16, n: 2, gap: 60, rpm: sign() * rnd(14, 22), phase: Math.random() }) },
   { name: '速度制限区画', sizable: true, make: () => ({ t: 'speedzone', x: 0, y: 0, w: 240, h: 180, limit: 400 }) },
   { name: '停止禁止区画', sizable: true, make: () => ({ t: 'nostop', x: 0, y: 0, w: 240, h: 180, min: 150, grace: 0.5 }) },
 ];
@@ -69,7 +82,14 @@ function bounds(p){
     case 'gate': { const r = p.thick / 2; return { x: Math.min(p.ax, p.bx) - r, y: Math.min(p.ay, p.by) - r, w: Math.abs(p.ax - p.bx) + 2 * r, h: Math.abs(p.ay - p.by) + 2 * r }; }
     case 'shooter': { const ex = p.x + p.dx * p.range, ey = p.y + p.dy * p.range, r = p.r; return { x: Math.min(p.x, ex) - r, y: Math.min(p.y, ey) - r, w: Math.abs(ex - p.x) + 2 * r, h: Math.abs(ey - p.y) + 2 * r }; }
     // 図鑑採用分。回転レーザー/狙い撃ち/影は本体(ハブ)だけを占有扱いにする（効果範囲は広くてよい）
-    case 'rotlaser': case 'aimed': case 'shadow': case 'beam': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
+    case 'rotlaser': case 'aimed': case 'shadow': case 'beam': case 'danmaku': case 'bounce': case 'burst': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
+    // 第2弾（index.html の bounds と同じ）
+    case 'patrol': { const xs = p.pts.map(q => q[0]), ys = p.pts.map(q => q[1]), x = Math.min(...xs) - p.w / 2, y = Math.min(...ys) - p.h / 2; return { x, y, w: Math.max(...xs) + p.w / 2 - x, h: Math.max(...ys) + p.h / 2 - y }; }
+    case 'breathe': return { x: p.x - p.w / 2, y: p.y - p.h / 2, w: p.w, h: p.h };
+    case 'ball': return { x: p.x - p.r, y: p.y - p.r, w: 2 * p.r, h: 2 * p.r };
+    case 'train': case 'ringwall': { const r = p.R + (p.t === 'train' ? p.size * 0.71 : p.thick / 2); return { x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }; }
+    case 'serpent': return p.vert ? { x: p.x - p.amp - p.r, y: 0, w: 2 * (p.amp + p.r), h: T.H } : { x: 0, y: p.y - p.amp - p.r, w: T.W, h: 2 * (p.amp + p.r) };
+    case 'seq': return { x: p.x - p.thick / 2, y: p.y - p.thick / 2, w: p.w + p.thick, h: p.h + p.thick };
     case 'rain': return { x: p.x, y: 0, w: p.w, h: T.H };
     case 'slidelaser': return { x: p.x - p.dx / 2 - p.thick, y: p.y - p.len / 2, w: p.dx + 2 * p.thick, h: p.len };
     case 'crusher': return { x: p.x, y: p.y - p.h / 2, w: p.w, h: p.h };
@@ -81,7 +101,7 @@ function bounds(p){
   return { x: p.x, y: p.y, w: 0, h: 0 };
 }
 const SIZABLE = new Set(['speedzone', 'nostop']);
-function translate(p, cx, cy){ const q = { ...p }; if (p.t === 'gate'){ q.ax += cx; q.bx += cx; q.ay += cy; q.by += cy; } else { q.x += cx; q.y += cy; } return q; }
+function translate(p, cx, cy){ const q = { ...p }; if (p.t === 'gate'){ q.ax += cx; q.bx += cx; q.ay += cy; q.by += cy; } else if (p.t === 'patrol') q.pts = p.pts.map(a => [a[0] + cx, a[1] + cy]); else { q.x += cx; q.y += cy; } return q; }
 function rectCircleClear(b, c, r){ const dx = Math.max(b.x - c.x, 0, c.x - (b.x + b.w)), dy = Math.max(b.y - c.y, 0, c.y - (b.y + b.h)); return Math.hypot(dx, dy) > r; }
 // 設置結果のピースを作る。範囲指定(sizable)は {x,y,w,h} の矩形、それ以外は中心座標 (cx,cy)
 function materialize(rel, m){
@@ -95,7 +115,7 @@ function materialize(rel, m){
   return translate(rel, cx, cy);
 }
 function placementOk(p){
-  const b = bounds(p), mustFit = ['wall', 'blink', 'slider', 'gate', 'crusher', 'slidelaser', 'warnfloor', 'speedzone', 'nostop', 'rain'].includes(p.t);
+  const b = bounds(p), mustFit = ['wall', 'blink', 'slider', 'gate', 'crusher', 'slidelaser', 'warnfloor', 'speedzone', 'nostop', 'rain', 'patrol', 'breathe', 'seq'].includes(p.t);
   if (mustFit && (b.x < 0 || b.y < 0 || b.x + b.w > T.W || b.y + b.h > T.H)) return false;
   if (p.t === 'beam' && (beamNear(p, START, T.PAD_R + 10) || beamNear(p, GOAL, T.PAD_R + 10))) return false; // パッドを貫く置き方は不可
   return rectCircleClear(b, START, T.PAD_R + 10) && rectCircleClear(b, GOAL, T.PAD_R + 10);

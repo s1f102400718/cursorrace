@@ -16,7 +16,8 @@ const exe = ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:
   await page.waitForFunction(() => { const c = DAILIES.get(today()); return c && !c.building; });
   await page.mouse.move(160, 600); await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(out, 's-0-menu.png') });
-  await page.mouse.click(160, 600); await page.waitForFunction(() => state === 'title' && course.lab);
+  await page.mouse.click(160, 600); await page.waitForFunction(() => state === 'lab');       // メニュー左下 → ラボの一覧
+  await page.mouse.click(170, 190); await page.waitForFunction(() => state === 'title' && course.shakeLab); // 先頭のカード SK-1
   for (let i = 0; i < 4; i++) await page.keyboard.press(']'); // 強さ ×2
   await page.mouse.move(120, 380); await page.mouse.move(90, 360); await page.waitForFunction(() => state === 'race');
   await page.mouse.move(330, 360, { steps: 12 }); await page.waitForTimeout(200);

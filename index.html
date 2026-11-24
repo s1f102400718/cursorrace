@@ -79,7 +79,7 @@ const T = {
   // 画面の振動（見た目だけ。当たり判定にもカーソルの位置にも一切使わない）
   SHAKE: {
     MAX: 12,                                              // 合計の揺れ幅の上限(px)
-    DEFAULT: { beam: 7, rotlaser: 4, crusher: 5, mine: 9 }, // shake を書いていないピースの揺れ幅(px)。0 か未記載なら揺れない
+    DEFAULT: { beam: 7, rotlaser: 4, crusher: 5, mine: 9, flood: 6 }, // shake を書いていないピースの揺れ幅(px)。0 か未記載なら揺れない
     LENS_R0: 90, LENS_R1: 230, LENS_STEPS: 14,            // カーソルから R0 までは揺らさず、R1 にかけて段階的に揺れへつなぐ（段の数）
   },
 };
@@ -110,9 +110,37 @@ const COURSE_VER = 'v0.2';
 // --- 2026-11-23 ---
 // beam      横断レーザー: (x,y) を通り画面を端から端まで貫く。予告→照射→休み   x,y,deg,thick,warn,on,off,phase
 // どのピースにも shake（揺れ幅px）を書ける。「撃っている間」「叩きつけた瞬間」など型ごとの山で画面が揺れる（shakeEnv）。
-const TAU = Math.PI * 2;
+// --- 第2弾（2026-11-24）: 図鑑の残り（時刻だけで動くもの）＋新案。どれも状態を持たない ---
+// danmaku   DM-1 リング / DM-2 扇 / DM-3 渦巻き  x,y,pattern('ring'|'fan'),n,speed,interval,r,spin(°/発),spread(°),aim(°),layers,life,phase
+// bounce    DM-5 反射弾: 箱の端で跳ね返る弾       x,y,n,speed,interval,r,life,spin, box:[x0,y0,x1,y1](省略で部屋全体)
+// burst     DM-8 炸裂弾: 親弾が弾けて子弾の輪     x,y,aim,spin,interval,speed,fuse,m,speed2,life2,r,r2
+// patrol    MV-4 巡回ブロック                     pts:[[x,y],...],speed,w,h,phase
+// breathe   MV-6 呼吸ブロック                     x,y(中心),w,h,period,min,phase
+// ball      MV-7 跳ねるボール                     x,y,vx,vy,r, box
+// train     MV-8 列車: 円軌道を走る連結車両       x,y,R,cars,size,rpm,spacing(°),phase
+// serpent   MV-9 蛇: 波打って横切る連結体         y(vert なら x),amp,wave,speed,segs,gap,r, vert(縦に進む)
+// seq       TR-3 レーザー順送り                   x,y,w,h,lines,slot,on,thick,phase
+// fakewall  TR-6 偽装壁（触れても死なない）       x,y,w,h
+// ghostwall TR-7 透明壁（近づくと見える）         x,y,w,h,reveal
+// dark      FX-1 暗闇（カーソルの周りだけ見える） radius
+// fog       FX-2 霧の区画（近づいた分だけ見える） x,y,w,h,reveal
+// gapwall   MV-10 すき間の壁: 部屋を横に掃く壁。すき間を通す   x(往復の中心),dx(往復幅),w,gy,gh,period,phase
+// ringwall  MV-11 回る輪: すき間のある輪の壁が回る             x,y,R,thick,n(すき間の数),gap(°),rpm,phase
+// flood     TR-8 浸水: 島（安全地帯）以外が一斉に即死になる    isl:[[x,y,r],...],period,duty,warn,phase
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
 function osc(t, period, phase){ return (1 - Math.cos(TAU * (t / period + (phase || 0)))) / 2; }
 function frac(v){ return (v % 1 + 1) % 1; }
+function fold(v, lo, hi){ const w = hi - lo; if (!(w > 0)) return lo; const u = ((v - lo) % (2 * w) + 2 * w) % (2 * w); return lo + (u > w ? 2 * w - u : u); } // 端で跳ね返る位置
+const boxOf = p => p.box || [0, 0, T.W, T.H];
+function patrolPos(p, t){ // 経路を一定速度で巡回
+  const pts = p.pts, n = pts.length, seg = []; let L = 0;
+  for (let i = 0; i < n; i++){ const a = pts[i], b = pts[(i + 1) % n], l = Math.hypot(b[0] - a[0], b[1] - a[1]); seg.push(l); L += l; }
+  let d = ((t * p.speed + (p.phase || 0) * L) % L + L) % L;
+  for (let i = 0; i < n; i++){ if (d <= seg[i]){ const a = pts[i], b = pts[(i + 1) % n], u = seg[i] ? d / seg[i] : 0; return { x: a[0] + (b[0] - a[0]) * u, y: a[1] + (b[1] - a[1]) * u }; } d -= seg[i]; }
+  return { x: pts[0][0], y: pts[0][1] };
+}
+function seqState(p, t){ const cyc = p.lines * p.slot, u = frac(t / cyc + (p.phase || 0)) * p.lines, act = Math.floor(u); return { act, on: (u - act) * p.slot < p.on }; } // act 番目が撃つ番
+function floodState(p, t){ const ph = frac(t / p.period + (p.phase || 0)) * p.period, on = ph < p.duty * p.period; return { on, k: ph, warn: !on && ph > p.period - p.warn }; }
 const hash = k => frac(Math.sin(k * 12.9898 + 78.233) * 43758.5453);
 // 状態を持つピースの状態置き場。マルチではピースが同期ごとに差し替わるので id で持つ
 const PSTATE = new Map();
@@ -149,6 +177,35 @@ function prims(room, t, env){
       case 'aimed': { const s = stateOf(p); for (const b of (s.b || [])) out.push({ k: 'circ', x: b.x, y: b.y, r: p.r, c: 'haz', src: p }); break; }
       case 'rotlaser': { const st = rotlaserState(p, t); if (st.on) out.push({ k: 'cap', ax: p.x, ay: p.y, bx: p.x + Math.cos(st.a) * p.len, by: p.y + Math.sin(st.a) * p.len, r: p.thick / 2, c: 'laser', src: p }); break; }
       case 'beam': { const st = beamState(p, t); if (st.on) out.push({ k: 'cap', ax: p.x - st.dx * 1700, ay: p.y - st.dy * 1700, bx: p.x + st.dx * 1700, by: p.y + st.dy * 1700, r: p.thick / 2, c: 'laser', src: p }); break; }
+      // ---- 第2弾 ----
+      case 'danmaku': { const ph = p.phase || 0, kmax = Math.floor(t / p.interval - ph), kmin = Math.max(0, Math.ceil((t - p.life) / p.interval - ph)), layers = p.layers || 1;
+        for (let k = kmin; k <= kmax; k++){ const age = t - (k + ph) * p.interval; if (age < 0 || age > p.life) continue; const base = (p.aim || 0) + k * (p.spin || 0);
+          for (let i = 0; i < p.n; i++){ const ang = (p.pattern === 'fan' ? base + (p.n > 1 ? -p.spread / 2 + i * p.spread / (p.n - 1) : 0) : base + i * 360 / p.n) * DEG, cx = Math.cos(ang), sy = Math.sin(ang);
+            for (let L = 0; L < layers; L++){ const d = age * p.speed * (1 - L * 0.22), x = p.x + cx * d, y = p.y + sy * d; if (x < -p.r || y < -p.r || x > T.W + p.r || y > T.H + p.r) continue; out.push({ k: 'circ', x, y, r: p.r, c: 'haz', src: p }); } } }
+        break; }
+      case 'bounce': { const b = boxOf(p), kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - p.life) / p.interval));
+        for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0 || age > p.life) continue;
+          for (let i = 0; i < p.n; i++){ const ang = (k * (p.spin || 0) + i * 360 / p.n) * DEG; out.push({ k: 'circ', x: fold(p.x + Math.cos(ang) * p.speed * age, b[0] + p.r, b[2] - p.r), y: fold(p.y + Math.sin(ang) * p.speed * age, b[1] + p.r, b[3] - p.r), r: p.r, c: 'haz', src: p }); } }
+        break; }
+      case 'burst': { const total = p.fuse + p.life2, kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - total) / p.interval));
+        for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0 || age > total) continue; const a = ((p.aim || 0) + k * (p.spin || 0)) * DEG, cx = Math.cos(a), sy = Math.sin(a);
+          if (age < p.fuse) out.push({ k: 'circ', x: p.x + cx * p.speed * age, y: p.y + sy * p.speed * age, r: p.r, c: 'haz', src: p });
+          else { const bx = p.x + cx * p.speed * p.fuse, by = p.y + sy * p.speed * p.fuse, a2 = age - p.fuse; for (let i = 0; i < p.m; i++){ const b = (i * 360 / p.m + k * 10) * DEG; out.push({ k: 'circ', x: bx + Math.cos(b) * p.speed2 * a2, y: by + Math.sin(b) * p.speed2 * a2, r: p.r2, c: 'haz', src: p }); } } }
+        break; }
+      case 'patrol': { const c = patrolPos(p, t); out.push({ k: 'rect', x: c.x - p.w / 2, y: c.y - p.h / 2, w: p.w, h: p.h, c: 'haz', src: p }); break; }
+      case 'breathe': { const s = p.min + (1 - p.min) * osc(t, p.period, p.phase), w = p.w * s, h = p.h * s; out.push({ k: 'rect', x: p.x - w / 2, y: p.y - h / 2, w, h, c: 'haz', src: p }); break; }
+      case 'ball': { const b = boxOf(p); out.push({ k: 'circ', x: fold(p.x + p.vx * t, b[0] + p.r, b[2] - p.r), y: fold(p.y + p.vy * t, b[1] + p.r, b[3] - p.r), r: p.r, c: 'haz', src: p }); break; }
+      case 'train': { for (let i = 0; i < p.cars; i++){ const a = (p.phase || 0) * TAU + t * p.rpm * TAU / 60 + i * p.spacing * DEG * Math.sign(p.rpm || 1) * -1; out.push({ k: 'rect', x: p.x + Math.cos(a) * p.R - p.size / 2, y: p.y + Math.sin(a) * p.R - p.size / 2, w: p.size, h: p.size, c: 'haz', src: p }); } break; }
+      case 'serpent': { const len = p.vert ? T.H : T.W, span = len + 400;
+        for (let i = 0; i < p.segs; i++){ const u = ((p.speed * t - i * p.gap * Math.sign(p.speed || 1)) % span + span) % span - 200, v = (p.vert ? p.x : p.y) + p.amp * Math.sin(TAU * u / p.wave); out.push({ k: 'circ', x: p.vert ? v : u, y: p.vert ? u : v, r: p.r, c: 'haz', src: p }); }
+        break; }
+      case 'seq': { const st = seqState(p, t); for (let i = 0; i < p.lines; i++){ const x = p.x + (p.lines > 1 ? i * p.w / (p.lines - 1) : 0); out.push({ k: 'cap', ax: x, ay: p.y, bx: x, by: p.y + p.h, r: p.thick / 2, c: 'laser', on: i === st.act && st.on, src: p }); } break; }
+      case 'ghostwall': out.push({ k: 'rect', x: p.x, y: p.y, w: p.w, h: p.h, c: 'hidden', src: p }); break; // 見えにくいだけで判定は壁と同じ
+      case 'fakewall': case 'dark': case 'fog': break; // 当たり判定なし
+      case 'gapwall': { const x = p.x - p.dx / 2 + p.dx * osc(t, p.period, p.phase) - p.w / 2, top = p.gy - p.gh / 2;
+        out.push({ k: 'rect', x, y: -40, w: p.w, h: top + 40, c: 'haz', src: p }, { k: 'rect', x, y: top + p.gh, w: p.w, h: T.H + 40 - top - p.gh, c: 'haz', src: p }); break; }
+      case 'ringwall': out.push({ k: 'arc', x: p.x, y: p.y, R: p.R, r: p.thick / 2, a0: (p.phase || 0) * TAU + t * p.rpm * TAU / 60, n: p.n, gap: p.gap * DEG, c: 'haz', src: p }); break;
+      case 'flood': { if (floodState(p, t).on) out.push({ k: 'safe', isl: p.isl, c: 'haz', src: p }); break; }
       case 'rain': { const life = (T.H + 2 * p.r) / p.speed, kmax = Math.floor(t / p.interval), kmin = Math.max(0, Math.ceil((t - life) / p.interval));
         for (let k = kmin; k <= kmax; k++){ const age = t - k * p.interval; if (age < 0) continue; const y = -p.r + p.speed * age; if (y > T.H + p.r) continue; out.push({ k: 'circ', x: p.x + hash(k * 7 + (p.seed || 1) * 131) * p.w, y, r: p.r, c: 'haz', src: p }); } break; }
       case 'slidelaser': { const cx = p.x - p.dx / 2 + p.dx * osc(t, p.period, p.phase); out.push({ k: 'cap', ax: cx, ay: p.y - p.len / 2, bx: cx, by: p.y + p.len / 2, r: p.thick / 2, c: 'laser', src: p }); break; }
@@ -203,6 +260,11 @@ function shakeEnv(p, t){
     case 'shooter': return Math.exp(-frac(t / p.interval + (p.phase || 0)) * p.interval * 16);   // 1発ごとの反動
     case 'aimed': return t > 0 ? Math.exp(-frac(t / p.interval) * p.interval * 16) : 0;
     case 'mine': { const s = PSTATE.get(p.id || p), ph = s && s.ph; return ph === 'blast' ? 1 : ph === 'armed' ? 0.2 : 0; } // 爆発中
+    case 'danmaku': return Math.exp(-frac(t / p.interval - (p.phase || 0)) * p.interval * 16);  // 1発ごとの反動
+    case 'bounce': case 'burst': return Math.exp(-frac(t / p.interval) * p.interval * 16);
+    case 'seq': return seqState(p, t).on ? 1 : 0;                                                 // 撃っている間
+    case 'gapwall': return Math.exp(-frac(2 * (t / p.period + (p.phase || 0))) * p.period / 2 * 9); // 端に当たった瞬間
+    case 'flood': { const st = floodState(p, t); return st.on ? Math.exp(-st.k * 5) : 0; }        // 浸水した瞬間
   }
   return 1; // 山のない型は、shake を書いたら出ている間ずっと揺れる
 }
@@ -226,7 +288,16 @@ function bounds(p){
     case 'orbit': { const r = p.R + p.r; return { x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }; }
     case 'gate': { const r = p.thick / 2; return { x: Math.min(p.ax, p.bx) - r, y: Math.min(p.ay, p.by) - r, w: Math.abs(p.ax - p.bx) + 2 * r, h: Math.abs(p.ay - p.by) + 2 * r }; }
     case 'shooter': { const ex = p.x + p.dx * p.range, ey = p.y + p.dy * p.range, r = p.r; return { x: Math.min(p.x, ex) - r, y: Math.min(p.y, ey) - r, w: Math.abs(ex - p.x) + 2 * r, h: Math.abs(ey - p.y) + 2 * r }; }
-    case 'rotlaser': case 'aimed': case 'shadow': case 'beam': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
+    case 'rotlaser': case 'aimed': case 'shadow': case 'beam': case 'danmaku': case 'bounce': case 'burst': return { x: p.x - 20, y: p.y - 20, w: 40, h: 40 };
+    // ---- 第2弾 ----
+    case 'patrol': { const xs = p.pts.map(q => q[0]), ys = p.pts.map(q => q[1]), x = Math.min(...xs) - p.w / 2, y = Math.min(...ys) - p.h / 2; return { x, y, w: Math.max(...xs) + p.w / 2 - x, h: Math.max(...ys) + p.h / 2 - y }; }
+    case 'breathe': return { x: p.x - p.w / 2, y: p.y - p.h / 2, w: p.w, h: p.h };
+    case 'ball': return { x: p.x - p.r, y: p.y - p.r, w: 2 * p.r, h: 2 * p.r };
+    case 'train': case 'ringwall': { const r = p.R + (p.t === 'train' ? p.size * 0.71 : p.thick / 2); return { x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }; }
+    case 'serpent': return p.vert ? { x: p.x - p.amp - p.r, y: 0, w: 2 * (p.amp + p.r), h: T.H } : { x: 0, y: p.y - p.amp - p.r, w: T.W, h: 2 * (p.amp + p.r) };
+    case 'seq': return { x: p.x - p.thick / 2, y: p.y - p.thick / 2, w: p.w + p.thick, h: p.h + p.thick };
+    case 'ghostwall': case 'fakewall': case 'fog': return { x: p.x, y: p.y, w: p.w, h: p.h };
+    case 'gapwall': return { x: p.x - p.dx / 2 - p.w / 2, y: 0, w: p.dx + p.w, h: T.H };
     case 'rain': return { x: p.x, y: 0, w: p.w, h: T.H };
     case 'slidelaser': return { x: p.x - p.dx / 2 - p.thick, y: p.y - p.len / 2, w: p.dx + 2 * p.thick, h: p.len };
     case 'crusher': return { x: p.x, y: p.y - p.h / 2, w: p.w, h: p.h };
@@ -240,7 +311,7 @@ function bounds(p){
 // 横断レーザーの線が点 c から r 以内を通るか（パッドを貫く置き方を禁止するため）
 function beamNear(p, c, r){ const a = (p.deg || 0) * Math.PI / 180; return Math.abs((c.x - p.x) * Math.sin(a) - (c.y - p.y) * Math.cos(a)) <= r + p.thick / 2; }
 const SIZABLE = new Set(['speedzone', 'nostop']);
-function translate(p, cx, cy){ const q = { ...p }; if (p.t === 'gate'){ q.ax += cx; q.bx += cx; q.ay += cy; q.by += cy; } else { q.x += cx; q.y += cy; } return q; }
+function translate(p, cx, cy){ const q = { ...p }; if (p.t === 'gate'){ q.ax += cx; q.bx += cx; q.ay += cy; q.by += cy; } else if (p.t === 'patrol') q.pts = p.pts.map(a => [a[0] + cx, a[1] + cy]); else { q.x += cx; q.y += cy; } return q; }
 function rectCircleClear(b, c, r){ const dx = Math.max(b.x - c.x, 0, c.x - (b.x + b.w)), dy = Math.max(b.y - c.y, 0, c.y - (b.y + b.h)); return Math.hypot(dx, dy) > r; }
 // 設置結果のピースを作る（server.js と同じ）。範囲指定は {x,y,w,h}、それ以外は中心 {x,y}
 function materialize(rel, m){
@@ -254,7 +325,7 @@ function materialize(rel, m){
   return translate(rel, cx, cy);
 }
 function placementOk(p, start, goal){
-  const b = bounds(p), mustFit = ['wall', 'blink', 'slider', 'gate', 'crusher', 'slidelaser', 'warnfloor', 'speedzone', 'nostop', 'rain'].includes(p.t);
+  const b = bounds(p), mustFit = ['wall', 'blink', 'slider', 'gate', 'crusher', 'slidelaser', 'warnfloor', 'speedzone', 'nostop', 'rain', 'patrol', 'breathe', 'seq'].includes(p.t);
   if (mustFit && (b.x < 0 || b.y < 0 || b.x + b.w > T.W || b.y + b.h > T.H)) return false;
   if (p.t === 'beam' && (beamNear(p, start, T.PAD_R + 10) || beamNear(p, goal, T.PAD_R + 10))) return false;
   return rectCircleClear(b, start, T.PAD_R + 10) && rectCircleClear(b, goal, T.PAD_R + 10);
@@ -407,6 +478,57 @@ const LAB = { id: 'lab-shake', name: 'SK-1 SHAKE LAB', desc: '画面の振動を
     { t: 'pulser', x: 950, y: 570, rmin: 20, rmax: 95, period: 2.2, phase: 0.5, shake: 4 },
   ]},
 ]};
+// 要素ラボ: 要素を1つずつ試す部屋（記録もランキングもなし）。メニューの「LAB」か L キーで一覧が開く。
+// code は図鑑の番号（sandbox/objects.html）。MV-10・MV-11・TR-8 は 2026-11-24 の新案。
+const RX = { x: 1190, y: 360 }; // ラボの部屋は 左(90,360) → 右(1190,360)
+const LABS = [
+  { code: 'SK-1', name: '画面の振動', desc: '撃っている間だけ揺れる', shake: true, rooms: LAB.rooms },
+  { code: 'DM-1', name: 'リング弾幕', desc: '全方向の輪。毎発ずれて隙間が流れる', rooms: [{ name: 'RING', exit: RX, cps: [], pieces: [
+    { t: 'danmaku', x: 640, y: 360, pattern: 'ring', n: 20, speed: 150, interval: 0.8, r: 6, spin: 7, life: 3.2 }] }] },
+  { code: 'DM-2', name: '扇の掃射', desc: '扇状に撃ちながら砲塔が回る', rooms: [{ name: 'FAN', exit: RX, cps: [], pieces: [
+    { t: 'danmaku', x: 640, y: 90, pattern: 'fan', n: 7, spread: 50, aim: 90, speed: 260, interval: 0.28, r: 6, spin: 6, life: 2.0 },
+    { t: 'danmaku', x: 640, y: 630, pattern: 'fan', n: 7, spread: 50, aim: 270, speed: 260, interval: 0.28, r: 6, spin: -6, life: 2.0, phase: 0.5 }] }] },
+  { code: 'DM-3', name: '渦巻き', desc: '少ない腕を高速で回して連射', rooms: [{ name: 'SPIRAL', exit: RX, cps: [], pieces: [
+    { t: 'danmaku', x: 640, y: 360, pattern: 'ring', n: 3, speed: 170, interval: 0.07, r: 5, spin: 11, life: 2.8 }] }] },
+  { code: 'DM-5', name: '反射弾', desc: '枠の端で跳ね返って溜まっていく', rooms: [{ name: 'BOUNCE', exit: RX, cps: [], pieces: [
+    { t: 'bounce', x: 640, y: 360, n: 8, speed: 220, interval: 1.6, r: 7, life: 5, spin: 15, box: [200, 30, 1080, 690] }] }] },
+  { code: 'DM-8', name: '炸裂弾', desc: '親弾が弾けて子弾の輪になる', rooms: [{ name: 'BURST', exit: RX, cps: [], pieces: [
+    { t: 'burst', x: 640, y: 360, aim: 0, spin: 47, interval: 1.1, speed: 150, fuse: 1.1, m: 12, speed2: 170, life2: 1.6, r: 9, r2: 5 }] }] },
+  { code: 'MV-4', name: '巡回ブロック', desc: '決まった経路を一定速度で回る', rooms: [{ name: 'PATROL', exit: RX, cps: [{ x: 640, y: 360 }], pieces: [
+    { t: 'patrol', pts: [[260, 140], [1020, 140], [1020, 580], [260, 580]], speed: 380, w: 70, h: 70, phase: 0 }, { t: 'patrol', pts: [[260, 140], [1020, 140], [1020, 580], [260, 580]], speed: 380, w: 70, h: 70, phase: 0.5 },
+    { t: 'patrol', pts: [[440, 230], [440, 490], [840, 490], [840, 230]], speed: 300, w: 60, h: 60, phase: 0 }, { t: 'patrol', pts: [[440, 230], [440, 490], [840, 490], [840, 230]], speed: 300, w: 60, h: 60, phase: 0.5 }] }] },
+  { code: 'MV-6', name: '呼吸ブロック', desc: '大きさが脈動する四角', rooms: [{ name: 'BREATHE', exit: RX, cps: [], pieces: [
+    { t: 'breathe', x: 380, y: 360, w: 200, h: 560, period: 2.2, min: 0.15, phase: 0 }, { t: 'breathe', x: 640, y: 360, w: 200, h: 560, period: 2.2, min: 0.15, phase: 0.33 }, { t: 'breathe', x: 900, y: 360, w: 200, h: 560, period: 2.2, min: 0.15, phase: 0.66 }] }] },
+  { code: 'MV-7', name: '跳ねるボール', desc: '枠の中を斜めに跳ね回る', rooms: [{ name: 'BALLS', exit: RX, cps: [], pieces: [
+    { t: 'ball', x: 300, y: 200, vx: 260, vy: 190, r: 30, box: [190, 20, 1090, 700] }, { t: 'ball', x: 900, y: 500, vx: -210, vy: 240, r: 26, box: [190, 20, 1090, 700] },
+    { t: 'ball', x: 640, y: 120, vx: 170, vy: -280, r: 34, box: [190, 20, 1090, 700] }, { t: 'ball', x: 500, y: 600, vx: -300, vy: -150, r: 24, box: [190, 20, 1090, 700] }] }] },
+  { code: 'MV-8', name: '列車', desc: '円軌道を走る連結車両の間を縫う', rooms: [{ name: 'TRAIN', exit: RX, cps: [{ x: 640, y: 360 }], pieces: [
+    { t: 'train', x: 640, y: 360, R: 240, cars: 7, size: 44, rpm: 18, spacing: 13 }, { t: 'train', x: 640, y: 360, R: 125, cars: 4, size: 40, rpm: -26, spacing: 24 }] }] },
+  { code: 'MV-9', name: '蛇', desc: '波打って横切る。頭と尾の外を回る', rooms: [{ name: 'SERPENT', exit: RX, cps: [], pieces: [
+    { t: 'serpent', vert: true, x: 380, amp: 90, wave: 380, speed: 240, segs: 14, gap: 24, r: 14 }, { t: 'serpent', vert: true, x: 640, amp: 90, wave: 320, speed: -280, segs: 12, gap: 24, r: 14 }, { t: 'serpent', vert: true, x: 900, amp: 90, wave: 420, speed: 320, segs: 16, gap: 24, r: 14 }] }] },
+  { code: 'MV-10', name: 'すき間の壁', desc: '部屋を掃く壁。すき間を通す', isNew: true, rooms: [{ name: 'GAPWALL', exit: RX, cps: [{ x: 630, y: 360 }], pieces: [
+    { t: 'gapwall', x: 400, dx: 300, w: 40, gy: 200, gh: 130, period: 3.2, phase: 0 }, { t: 'gapwall', x: 860, dx: 300, w: 40, gy: 520, gh: 130, period: 2.6, phase: 0.5 }] }] },
+  { code: 'MV-11', name: '回る輪', desc: 'すき間のある輪の壁が回る', isNew: true, rooms: [{ name: 'RINGS', exit: RX, cps: [{ x: 640, y: 360 }], pieces: [
+    { t: 'wall', x: 625, y: 0, w: 30, h: 46 }, { t: 'wall', x: 625, y: 674, w: 30, h: 46 },
+    { t: 'ringwall', x: 640, y: 360, R: 120, thick: 18, n: 2, gap: 70, rpm: 20, phase: 0 }, { t: 'ringwall', x: 640, y: 360, R: 210, thick: 18, n: 2, gap: 50, rpm: -14, phase: 0.2 }, { t: 'ringwall', x: 640, y: 360, R: 300, thick: 18, n: 3, gap: 38, rpm: 9, phase: 0.6 }] }] },
+  { code: 'TR-3', name: 'レーザー順送り', desc: '並んだレーザーが端から順に撃つ', rooms: [{ name: 'SEQUENCE', exit: RX, cps: [], pieces: [
+    { t: 'wall', x: 320, y: 0, w: 640, h: 50 }, { t: 'wall', x: 320, y: 670, w: 640, h: 50 },
+    { t: 'seq', x: 340, y: 50, w: 600, h: 620, lines: 6, slot: 0.35, on: 0.28, thick: 10 }] }] },
+  { code: 'TR-6', name: '偽装壁', desc: '縁が破線の壁は偽物。通り抜けられる', rooms: [{ name: 'FAKE', exit: RX, cps: [], pieces: [
+    { t: 'wall', x: 380, y: 0, w: 40, h: 300 }, { t: 'fakewall', x: 380, y: 300, w: 40, h: 120 }, { t: 'wall', x: 380, y: 420, w: 40, h: 300 },
+    { t: 'wall', x: 640, y: 120, w: 40, h: 600 }, { t: 'fakewall', x: 640, y: 0, w: 40, h: 120 },
+    { t: 'wall', x: 900, y: 0, w: 40, h: 540 }, { t: 'fakewall', x: 900, y: 540, w: 40, h: 180 }, { t: 'orbit', x: 780, y: 360, R: 80, r: 16, rpm: 40 }] }] },
+  { code: 'TR-7', name: '透明壁', desc: '近づいたときだけ見える壁', rooms: [{ name: 'GHOST', exit: RX, cps: [], pieces: [
+    { t: 'ghostwall', x: 400, y: 0, w: 40, h: 460, reveal: 170 }, { t: 'ghostwall', x: 640, y: 260, w: 40, h: 460, reveal: 170 }, { t: 'ghostwall', x: 880, y: 0, w: 40, h: 460, reveal: 170 }] }] },
+  { code: 'TR-8', name: '浸水', desc: '島の外が一斉に即死になる', isNew: true, rooms: [{ name: 'FLOOD', exit: RX, cps: [{ x: 560, y: 470 }], pieces: [
+    { t: 'flood', isl: [[90, 360, 95], [330, 200, 80], [560, 470, 80], [800, 230, 80], [1010, 480, 80], [1190, 360, 95]], period: 3.6, duty: 0.42, warn: 0.9, phase: 0.45 }] }] },
+  { code: 'FX-1', name: '暗闇', desc: '走り出すとカーソルの周りしか見えない', rooms: [{ name: 'DARK', exit: RX, cps: [{ x: 800, y: 600 }], pieces: [
+    { t: 'dark', radius: 190 }, { t: 'wall', x: 330, y: 0, w: 40, h: 480 }, { t: 'wall', x: 630, y: 240, w: 40, h: 480 }, { t: 'wall', x: 930, y: 0, w: 40, h: 480 },
+    { t: 'orbit', x: 500, y: 600, R: 70, r: 16, rpm: 44 }, { t: 'orbit', x: 800, y: 120, R: 70, r: 16, rpm: -44 }] }] },
+  { code: 'FX-2', name: '霧の区画', desc: '区画の中は近づいた分だけ見える', rooms: [{ name: 'FOG', exit: RX, cps: [], pieces: [
+    { t: 'fog', x: 300, y: 40, w: 680, h: 640, reveal: 130 }, { t: 'orbit', x: 480, y: 360, R: 90, r: 16, rpm: 40 }, { t: 'orbit', x: 800, y: 360, R: 90, r: 16, rpm: -40, phase: 0.5 },
+    { t: 'pulser', x: 640, y: 150, rmin: 18, rmax: 80, period: 2, phase: 0 }, { t: 'pulser', x: 640, y: 570, rmin: 18, rmax: 80, period: 2, phase: 0.5 }] }] },
+];
 let course = COURSES[0], ROOMS = course.rooms, START = course.start;
 function roomEntry(i){ return i === 0 ? START : ROOMS[i - 1].exit; }
 
@@ -441,6 +563,17 @@ function hit(pr, ax, ay, bx, by, r){
   if (pr.k === 'rect') return segRect(ax, ay, bx, by, pr.x - r, pr.y - r, pr.x + pr.w + r, pr.y + pr.h + r);
   if (pr.k === 'circ') return segPointDist(ax, ay, bx, by, pr.x, pr.y) <= pr.r + r;
   if (pr.k === 'cap') return segSegDist(ax, ay, bx, by, pr.ax, pr.ay, pr.bx, pr.by) <= pr.r + r;
+  if (pr.k === 'arc'){ // すき間のある輪。線分を細かく刻み、輪の帯の上にいて、すき間（各区画の先頭 gap ラジアン）の外なら当たり
+    const n = Math.min(48, Math.ceil(Math.hypot(bx - ax, by - ay) / 4)), sec = TAU / pr.n;
+    for (let i = 0; i <= n; i++){
+      const u = n ? i / n : 0, x = ax + (bx - ax) * u - pr.x, y = ay + (by - ay) * u - pr.y, d = Math.hypot(x, y);
+      if (Math.abs(d - pr.R) > pr.r + r) continue;
+      const a = ((Math.atan2(y, x) - pr.a0) % sec + sec) % sec, mg = r / Math.max(1, d); // カーソルの半径ぶん、すき間は狭くなる
+      if (!(a >= mg && a <= pr.gap - mg)) return true;
+    }
+    return false;
+  }
+  if (pr.k === 'safe') return !pr.isl.some(q => Math.hypot(bx - q[0], by - q[1]) <= q[2] - r); // 浸水: いまの位置がどの島の上でもなければ当たり
   return false;
 }
 function sweepHit(ps, ax, ay, bx, by){
@@ -461,6 +594,11 @@ function solveRoom(room, from, exit, t0, wantPath, horizon, prof){
   const paint = (buf, ps) => {
     for (const pr of ps){
       if (pr.on === false) continue;
+      if (pr.k === 'arc' || pr.k === 'safe'){ // 輪は外接する四角の中、浸水は部屋全体を、1セルずつ当たり判定で塗る
+        const q = pr.k === 'arc' ? pr.R + pr.r + m : 0, a0 = pr.k === 'arc' ? Math.max(0, Math.floor((pr.x - q) / g)) : 0, a1 = pr.k === 'arc' ? Math.min(nx - 1, Math.floor((pr.x + q) / g)) : nx - 1, b0 = pr.k === 'arc' ? Math.max(0, Math.floor((pr.y - q) / g)) : 0, b1 = pr.k === 'arc' ? Math.min(ny - 1, Math.floor((pr.y + q) / g)) : ny - 1;
+        for (let j = b0; j <= b1; j++) for (let i = a0; i <= a1; i++) if (hit(pr, i * g + g / 2, j * g + g / 2, i * g + g / 2, j * g + g / 2, m)) buf[j * nx + i] = 1;
+        continue;
+      }
       const rr = (pr.k === 'rect' ? 0 : pr.r) + m;
       const x0 = pr.k === 'rect' ? pr.x - m : pr.k === 'circ' ? pr.x - rr : Math.min(pr.ax, pr.bx) - rr, x1 = pr.k === 'rect' ? pr.x + pr.w + m : pr.k === 'circ' ? pr.x + rr : Math.max(pr.ax, pr.bx) + rr;
       const y0 = pr.k === 'rect' ? pr.y - m : pr.k === 'circ' ? pr.y - rr : Math.min(pr.ay, pr.by) - rr, y1 = pr.k === 'rect' ? pr.y + pr.h + m : pr.k === 'circ' ? pr.y + rr : Math.max(pr.ay, pr.by) + rr;
@@ -516,6 +654,14 @@ function padSafe(pieces, c, rad){
       case 'pulser': if (ci(p.x, p.y, p.rmax)) return false; break;
       case 'rotlaser': if (ci(p.x, p.y, p.len + p.thick / 2)) return false; break;
       case 'beam': if (beamNear(p, c, rad)) return false; break;
+      // ---- 第2弾 ----
+      case 'danmaku': if (ci(p.x, p.y, p.speed * p.life + p.r)) return false; break; // 弾が届く円
+      case 'burst': if (ci(p.x, p.y, p.speed * p.fuse + p.speed2 * p.life2 + Math.max(p.r, p.r2))) return false; break;
+      case 'bounce': case 'ball': { const b = boxOf(p); if (rc({ x: b[0], y: b[1], w: b[2] - b[0], h: b[3] - b[1] })) return false; break; } // 跳ね回る箱の中は全部危険
+      case 'patrol': case 'breathe': case 'seq': case 'ghostwall': case 'gapwall': case 'serpent': if (rc(bounds(p))) return false; break;
+      case 'train': case 'ringwall': { const d = Math.hypot(c.x - p.x, c.y - p.y), r = p.t === 'train' ? p.size * 0.71 : p.thick / 2; if (!(d + rad < p.R - r || d - rad > p.R + r)) return false; break; }
+      case 'flood': if (!p.isl.some(q => Math.hypot(c.x - q[0], c.y - q[1]) + rad <= q[2])) return false; break; // パッドは島の上に無いといけない
+      case 'fakewall': case 'dark': case 'fog': break; // 当たらない
       case 'orbit': { const d = Math.hypot(c.x - p.x, c.y - p.y); if (!(d + rad < p.R - p.r || d - rad > p.R + p.r)) return false; break; }
       case 'gate': if (segPointDist(p.ax, p.ay, p.bx, p.by, c.x, c.y) <= p.thick / 2 + rad) return false; break;
       case 'shooter': if (segPointDist(p.x, p.y, p.x + p.dx * p.range, p.y + p.dy * p.range, c.x, c.y) <= p.r + rad) return false; break;
@@ -528,7 +674,11 @@ function padSafe(pieces, c, rad){
 // ===================== デイリーコース生成 =====================
 // 日付(JST)をシードに部屋の型を選んでパラメータを振り、ソルバーで「必ず通れる」ことを確かめてから採用する。
 // 生成結果が変わる変更をしたら GEN_VER を上げる（ランキングのキーに入っているので、古い記録と混ざらない）。
-const GEN_VER = 'g2'; // g2 (2026-11-24): 全体を難しく。難度の底上げ＋部屋に障害物を重ねる「上乗せ」＋人間向けの通過保証
+// 版は日付で切り替える [この日から, 版]。新しい要素は「明日から」入れるので、今日までのコースと記録はそのまま残る。
+//   g2 (2026-11-24): 全体を難しく。難度の底上げ＋部屋に障害物を重ねる「上乗せ」＋人間向けの通過保証
+//   g3 (2026-11-25〜): 第2弾の要素（弾幕・蛇・列車・すき間の壁・回る輪・浸水・暗闇 ほか）の型と上乗せを追加
+const GEN_SCHEDULE = [['2026-11-23', 'g2'], ['2026-11-25', 'g3']];
+function genVer(date){ let v = GEN_SCHEDULE[0][1]; for (const [from, ver] of GEN_SCHEDULE) if (date >= from) v = ver; return v; }
 const DAILY = {
   EPOCH: '2026-11-23',          // この日が #1
   TZ_MIN: 540,                  // 日付の切り替えは JST 0:00
@@ -671,6 +821,66 @@ const ARCH = {
       for (let a = 0; a < 8; a++){ const p = translate(rel, R.i(13, 51) * 20, R.i(5, 31) * 20); if (placementOk(p, E, X) && padSafe([p], E, SV.PAD_SAFE + 16) && padSafe([p], X, SV.PAD_SAFE + 16)){ pieces.push(p); break; } } }
     return { cps: [{ x: 640, y: 360 }, F.pt(640, 80)], pieces };
   },
+  // ---- ここから g3（2026-11-25〜）: 第2弾の要素を使う型。上の型は g2 の日のコースを変えないため触らない ----
+  DANMAKU(R, d, F){ // 中央の砲台が輪か渦を撃つ。弾の寿命はパッドに届かない長さ
+    const L = (a, b) => a + (b - a) * d, spiral = R.chance(0.4);
+    const p = spiral ? { t: 'danmaku', x: 640, y: 360, pattern: 'ring', n: d < 0.6 ? 3 : 4, speed: ri(L(150, 190)), interval: r2(L(0.09, 0.06)), r: 5, spin: r2(R.sign() * L(9, 13)) }
+      : { t: 'danmaku', x: 640, y: 360, pattern: 'ring', n: ri(L(14, 22)), speed: ri(L(130, 175)), interval: r2(L(1.0, 0.65)), r: 6, spin: r2(R.sign() * R.f(5, 9)) };
+    p.life = r2(470 / p.speed);
+    return { cps: [], pieces: [p] };
+  },
+  TWINS(R, d, F){ // 砲台2つ。真ん中の上に息をつける場所がある
+    const L = (a, b) => a + (b - a) * d, speed = ri(L(120, 160)), n = ri(L(10, 16)), interval = r2(L(1.1, 0.75)), s = R.sign();
+    return { cps: [F.pt(640, 80)], pieces: [430, 850].map((x, i) => ({ t: 'danmaku', ...F.pt(x, 360), pattern: 'ring', n, speed, interval, r: 6, spin: r2((i ? -s : s) * R.f(5, 9)), life: r2(270 / speed), phase: i * 0.5 })) };
+  },
+  BURSTS(R, d, F){ // 親弾が飛んで弾ける。弾ける場所を読む
+    const L = (a, b) => a + (b - a) * d, speed = ri(L(130, 160)), fuse = r2(L(1.2, 1.0)), speed2 = ri(L(150, 190));
+    return { cps: [], pieces: [{ t: 'burst', x: 640, y: 360, aim: R.i(0, 359), spin: R.pick([37, 47, 61, 83]), interval: r2(L(1.2, 0.8)), speed, fuse, m: ri(L(10, 16)), speed2, life2: r2((460 - speed * fuse) / speed2), r: 9, r2: 5 }] };
+  },
+  SERPENTS(R, d, F){ // 縦に流れる蛇を何本も横切る
+    const L = (a, b) => a + (b - a) * d, n = d < 0.6 ? 3 : 4, s = R.sign(), pieces = [];
+    for (let i = 0; i < n; i++) pieces.push({ t: 'serpent', vert: true, x: ri(340 + i * 600 / (n - 1)), amp: ri(L(70, 105)), wave: R.i(300, 440), speed: ri((i % 2 ? -s : s) * L(220, 330)), segs: ri(L(11, 17)), gap: 24, r: 14 });
+    return { cps: [], pieces };
+  },
+  TRAINS(R, d, F){ // 2つの環状線。車両の間を縫って中を通る。上下の抜け道は壁で塞ぐ
+    const L = (a, b) => a + (b - a) * d, RR = ri(L(170, 200)), cars = ri(L(5, 8)), rpm = R.sign() * L(16, 26), wh = 360 - RR - 24, pieces = [];
+    [430, 850].forEach((x, i) => { pieces.push({ t: 'train', ...F.pt(x, 360), R: RR, cars, size: 42, rpm: r2(i ? -rpm : rpm), spacing: 15, phase: r2(R.f(0, 1)) }); pieces.push({ t: 'wall', ...F.rect(x - 15, 0, 30, wh) }, { t: 'wall', ...F.rect(x - 15, T.H - wh, 30, wh) }); });
+    return { cps: [F.pt(850, 360)], pieces };
+  },
+  BALLROOM(R, d, F){ // 枠の中を跳ね回るボールの群れ
+    const L = (a, b) => a + (b - a) * d, n = ri(L(3, 6)), v = L(240, 360), pieces = [];
+    for (let i = 0; i < n; i++){ const a = (R.pick([0, 90, 180, 270]) + R.i(25, 65)) * DEG, sp = v * R.f(0.8, 1.15); pieces.push({ t: 'ball', x: R.i(240, 1040), y: R.i(70, 650), vx: ri(Math.cos(a) * sp), vy: ri(Math.sin(a) * sp), r: R.i(20, 34), box: [190, 20, 1090, 700] }); }
+    return { cps: [], pieces };
+  },
+  PATROLS(R, d, F){ // 外周と内周を逆向きに巡回するブロック。上下の抜け道は壁で塞ぐ
+    const L = (a, b) => a + (b - a) * d, k = d < 0.5 ? 2 : 3, sp = ri(L(300, 430)), sp2 = ri(L(240, 340)), flip = R.chance(0.5);
+    const outer = [[250, 130], [1030, 130], [1030, 590], [250, 590]], inner = [[440, 240], [440, 480], [840, 480], [840, 240]], pieces = [{ t: 'wall', x: 625, y: 0, w: 30, h: 95 }, { t: 'wall', x: 625, y: 625, w: 30, h: 95 }];
+    for (let i = 0; i < k; i++) pieces.push({ t: 'patrol', pts: flip ? outer.slice().reverse() : outer, speed: sp, w: 66, h: 66, phase: r2(i / k) });
+    for (let i = 0; i < 2; i++) pieces.push({ t: 'patrol', pts: flip ? inner.slice().reverse() : inner, speed: sp2, w: 56, h: 56, phase: r2(i / 2) });
+    return { cps: [{ x: 640, y: 360 }], pieces };
+  },
+  GAPWALLS(R, d, F){ // 左右2つの区間を、すき間のある壁が掃く。すき間の高さは区間ごとに違う
+    const L = (a, b) => a + (b - a) * d, gh = ri(L(150, 105)), ys = R.shuffle([150, 290, 430, 570]);
+    return { cps: [F.pt(640, 360)], pieces: [405, 875].map((x, i) => ({ t: 'gapwall', x: F.X(x), dx: 310, w: 40, gy: ys[i], gh, period: r2(R.f(L(3.4, 2.4), L(3.0, 2.1))), phase: r2(R.f(0, 1)) })) };
+  },
+  RINGS(R, d, F){ // 中心を囲む輪が逆向きに回る。すき間を乗り継いで中を抜ける。上下の抜け道は壁で塞ぐ
+    const L = (a, b) => a + (b - a) * d, rings = d < 0.6 ? [[130, 2], [240, 3]] : [[120, 2], [205, 2], [290, 3]], gapPx = L(170, 115), s = R.sign(), pieces = [];
+    rings.forEach(([RR, n], i) => pieces.push({ t: 'ringwall', x: 640, y: 360, R: RR, thick: 18, n, gap: ri(gapPx / RR / DEG), rpm: r2((i % 2 ? -s : s) * L(14, 24) * 120 / RR), phase: r2(R.f(0, 1)) }));
+    const wh = 360 - (rings[rings.length - 1][0] + 9) - 6; if (wh > 14) pieces.push({ t: 'wall', x: 625, y: 0, w: 30, h: wh }, { t: 'wall', x: 625, y: T.H - wh, w: 30, h: wh });
+    return { cps: [{ x: 640, y: 360 }], pieces };
+  },
+  FLOOD(R, d, F){ // 島を渡る。浸水のあいだは島の外が即死
+    const L = (a, b) => a + (b - a) * d, k = d < 0.6 ? 4 : 3, rad = ri(L(84, 66)), isl = [[F.X(90), 360, 95]];
+    for (let i = 0; i < k; i++) isl.push([F.X(ri(330 + i * 620 / (k - 1))), F.Y(i % 2 ? R.pick([500, 530]) : R.pick([190, 220])), rad]);
+    isl.push([F.X(1190), 360, 95]);
+    const mid = isl[1 + (k >> 1)], pieces = [{ t: 'flood', isl, period: r2(L(4.0, 3.0)), duty: r2(L(0.4, 0.5)), warn: 0.9, phase: r2(R.f(0, 1)) }];
+    if (d > 0.6) for (const q of [isl[1], isl[k]]) pieces.push({ t: 'orbit', x: q[0], y: q[1], R: rad + 34, r: 14, rpm: ri(R.sign() * 36), phase: r2(R.f(0, 1)) }); // 島の縁を回る邪魔
+    return { cps: [{ x: mid[0], y: mid[1] }], pieces };
+  },
+  BREATHERS(R, d, F){ // 部屋の高さいっぱいまで膨らむ四角。縮んだ隙に上下を抜ける
+    const L = (a, b) => a + (b - a) * d, w = ri(L(150, 190)), h = ri(L(680, 760)), per = r2(L(2.6, 1.8)), st = R.pick([0.25, 0.33, 0.5]), p0 = R.f(0, 1);
+    return { cps: [], pieces: [360, 640, 920].map((x, i) => ({ t: 'breathe', x: F.X(x), y: 360, w, h, period: per, min: r2(L(0.2, 0.12)), phase: r2((p0 + i * st) % 1) })) };
+  },
 };
 const ARCH_MIN_TIER = {}; // 段階ごとに出さない型（g2 では全部の型をどの日にも出す）
 // 上乗せ: 型で作った部屋に、さらに重ねる障害物。(R 乱数, d 難度0..1) → ピースの配列。
@@ -687,7 +897,23 @@ const MODS = {
   PENDULUM(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'bar', x: R.i(20, 44) * 20, y: R.pick([0, 720]), len: ri(L(380, 470)), thick: 14, rpm: r2(R.sign() * L(9, 14)), phase: r2(R.f(0, 1)), anchor: 'end' }]; },
   PULSE(R, d){ const L = (a, b) => a + (b - a) * d, per = r2(R.f(1.6, 2.2)), xs = R.shuffle([340, 460, 580, 700, 820, 940]).slice(0, 2); return xs.map((x, i) => ({ t: 'pulser', x, y: 360, rmin: 14, rmax: ri(L(70, 95)), period: per, phase: i * 0.5 })); },
   LASER(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'rotlaser', x: R.i(22, 42) * 20, y: R.pick([150, 570]), len: 330, rpm: r2(R.sign() * L(5, 8)), thick: 10, on: r2(L(1.3, 1.9)), warn: 0.7, off: r2(L(1.8, 1.3)), phase: r2(R.f(0, 1)) }]; },
+  // ---- ここから g3（2026-11-25〜）----
+  BALL(R, d){ const L = (a, b) => a + (b - a) * d, n = d > 0.8 ? 2 : 1, out = []; for (let i = 0; i < n; i++){ const a = (R.pick([0, 90, 180, 270]) + R.i(25, 65)) * DEG, sp = L(240, 340); out.push({ t: 'ball', x: R.i(240, 1040), y: R.i(70, 650), vx: ri(Math.cos(a) * sp), vy: ri(Math.sin(a) * sp), r: R.i(22, 32), box: [190, 20, 1090, 700] }); } return out; },
+  SERPENT(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'serpent', vert: true, x: R.i(17, 47) * 20, amp: ri(L(70, 100)), wave: R.i(300, 440), speed: ri(R.sign() * L(220, 320)), segs: ri(L(11, 16)), gap: 24, r: 14 }]; },
+  TRAIN(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'train', x: R.i(20, 44) * 20, y: 360, R: ri(L(110, 150)), cars: ri(L(4, 6)), size: 38, rpm: r2(R.sign() * L(20, 30)), spacing: 20, phase: r2(R.f(0, 1)) }]; },
+  FAN(R, d){ // 上か下の縁から扇状に撃つ砲台。弾の寿命は左右どちらのパッドにも届かない長さ
+    const L = (a, b) => a + (b - a) * d, top = R.chance(0.5), x = R.i(18, 46) * 20, y = top ? 60 : 660, speed = 240, reach = Math.min(520, Math.min(Math.hypot(x - 90, y - 360), Math.hypot(x - 1190, y - 360)) - 64);
+    return [{ t: 'danmaku', x, y, pattern: 'fan', n: 5, spread: 40, aim: top ? 90 : 270, speed, interval: r2(L(0.4, 0.28)), r: 6, spin: r2(R.sign() * L(4, 7)), life: r2(reach / speed) }];
+  },
+  SEQ(R, d){ const L = (a, b) => a + (b - a) * d, slot = r2(L(0.4, 0.28)); return [{ t: 'seq', x: R.i(16, 30) * 20, y: 40, w: 320, h: 640, lines: 4, slot, on: r2(slot * 0.8), thick: 10, phase: r2(R.f(0, 1)) }]; },
+  DARK(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'dark', radius: ri(L(240, 180)) }]; }, // 見え方だけが変わる。通れるかどうかには関わらない
+  GAPWALL(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'gapwall', x: R.i(20, 44) * 20, dx: 260, w: 36, gy: R.i(6, 30) * 20, gh: ri(L(150, 110)), period: r2(L(3.2, 2.4)), phase: r2(R.f(0, 1)) }]; },
+  BREATHE(R, d){ const L = (a, b) => a + (b - a) * d; return [{ t: 'breathe', x: R.i(20, 44) * 20, y: 360, w: 180, h: ri(L(520, 700)), period: r2(L(2.6, 1.9)), min: 0.15, phase: r2(R.f(0, 1)) }]; },
 };
+// いつの版から使うか（書いていないものは最初から）。新しい型・上乗せは、既に遊ばれた日のコースを変えないよう版を上げて足す
+const ARCH_SINCE = { DANMAKU: 3, TWINS: 3, BURSTS: 3, SERPENTS: 3, TRAINS: 3, BALLROOM: 3, PATROLS: 3, GAPWALLS: 3, RINGS: 3, FLOOD: 3, BREATHERS: 3 };
+const MOD_SINCE = { BALL: 3, SERPENT: 3, TRAIN: 3, FAN: 3, SEQ: 3, DARK: 3, GAPWALL: 3, BREATHE: 3 };
+const MOD_MIN_HEAT = { DARK: 0.8 }; // この熱さ以上の部屋にだけ付く上乗せ
 // 部屋の検査。通れば BOT の経路つきの解を返す。1回解くごとに yield して画面へ返す（重い日でも固まらないように）
 function* roomOk(rm, pos, entry, exit, t, limit, tick){
   const s = solveRoom(rm, pos, exit, t, true, limit); yield tick; if (!s.ok) return null;
@@ -706,8 +932,9 @@ function dayShift(key, n){ return new Date(dayMs(key) + n * 86400000).toISOStrin
 function dayDow(key){ return new Date(dayMs(key)).getUTCDay(); }
 // 生成本体。重いので1部屋ごとに yield する（画面を止めないため）。最後に course を return する
 function* dailyGen(date){
-  const tier = DAILY.TIER_BY_DOW[dayDow(date)], base = DAILY.TIER_D[tier], seed = 'cursorrun|' + GEN_VER + '|' + date;
-  const names = RNG(seed).shuffle(Object.keys(ARCH).filter(k => (ARCH_MIN_TIER[k] || 0) <= tier));
+  const ver = genVer(date), vn = +ver.slice(1), tier = DAILY.TIER_BY_DOW[dayDow(date)], base = DAILY.TIER_D[tier], seed = 'cursorrun|' + ver + '|' + date;
+  const names = RNG(seed).shuffle(Object.keys(ARCH).filter(k => (ARCH_MIN_TIER[k] || 0) <= tier && (ARCH_SINCE[k] || 0) <= vn));
+  const modNames = Object.keys(MODS).filter(k => (MOD_SINCE[k] || 0) <= vn);
   const start = { x: 90, y: 360 }, rooms = [], bot = []; let t = 0, pos = start, fallbacks = 0, gold = 0;
   for (let i = 0; i < DAILY.ROOMS; i++){
     const heat = base + (i / (DAILY.ROOMS - 1) - 0.5) * 0.3, d = clamp01(heat), dir = i % 2 ? -1 : 1, entry = i === 0 ? start : rooms[i - 1].exit, exit = { x: dir > 0 ? 1190 : 90, y: 360 };
@@ -726,7 +953,7 @@ function* dailyGen(date){
     // 上乗せ: 熱さに応じた数だけ、別の障害物を重ねる。重ねても通れる組み合わせだけ残す
     const want = Math.max(0, Math.min(DAILY.MOD_MAX, Math.floor((heat - DAILY.MOD_FROM) / DAILY.MOD_STEP + 1e-9))), used = [];
     for (let q = 0; q < 8 && used.length < want; q++){
-      const R = RNG(seed + '|' + i + '|m' + q), mk = R.pick(Object.keys(MODS)); if (used.includes(mk)) continue;
+      const R = RNG(seed + '|' + i + '|m' + q), mk = R.pick(modNames); if (used.includes(mk) || (MOD_MIN_HEAT[mk] || 0) > heat) continue;
       const extra = MODS[mk](R, d);
       if (!padSafe(extra, entry, SV.PAD_SAFE) || !padSafe(extra, exit, SV.PAD_SAFE)) continue;
       const rm = { name: room.name, mods: used.concat(mk), exit, cps: room.cps.filter(c => padSafe(extra, c, SV.PAD_SAFE)), pieces: room.pieces.concat(extra) };
@@ -740,7 +967,7 @@ function* dailyGen(date){
     yield i + 1;
   }
   const par = Math.round(t * 100) / 100, hash = fnv(JSON.stringify({ start, rooms })), g = Math.ceil(gold);
-  return { id: 'daily', key: 'd-' + date + '-' + GEN_VER + '-' + hash, name: 'DAILY #' + dayNum(date), desc: date, daily: { date, num: dayNum(date), tier, hash, fallbacks },
+  return { id: 'daily', key: 'd-' + date + '-' + ver + '-' + hash, name: 'DAILY #' + dayNum(date), desc: date, daily: { date, num: dayNum(date), tier, hash, fallbacks, ver },
     medals: [g, Math.ceil(g * DAILY.MEDAL.SILVER), Math.ceil(g * DAILY.MEDAL.BRONZE)], start, rooms, par, bot };
 }
 function buildDaily(date){ const g = dailyGen(date); for (;;){ const r = g.next(); if (r.done) return r.value; } }
@@ -781,6 +1008,7 @@ function decodeGhost(str){
 const cvs = document.getElementById('c'), mainCtx = cvs.getContext('2d');
 // 描画関数はすべて ctx に描く。普段は画面、振動中だけ「揺らさない絵」を作るために fx（画面外の板）へ切り替える
 let ctx = mainCtx;
+let VIEW_C = null, THUMB = false; // VIEW_C: 見ている人の位置（カーソル。リプレイでは追っている走り）。透明壁・暗闇・霧が使う。THUMB: 縮小図を描いている最中
 const fx = document.createElement ? document.createElement('canvas') : null, fxCtx = fx ? fx.getContext('2d') : null;
 const H = { time: document.getElementById('hTime'), room: document.getElementById('hRoom'), name: document.getElementById('hName'), line3: document.getElementById('hLine3'),
   deaths: document.getElementById('hDeaths'), best: document.getElementById('hBest'), dbg: document.getElementById('hDbg'), msg: document.getElementById('msg'),
@@ -924,7 +1152,7 @@ function ghostFor(c, row){
 const DAILIES = new Map(); // 日付 → course | { building, progress }
 function ensureDaily(date){
   const have = DAILIES.get(date); if (have) return have.building ? null : have;
-  const lk = 'cursorrun.daily.' + GEN_VER + '.' + date; let c = null;
+  const lk = 'cursorrun.daily.' + genVer(date) + '.' + date; let c = null;
   try { c = JSON.parse(LS.get(lk)); if (c && c.rooms && c.key) c.bot = decodeGhost(c.bot) || []; else c = null; } catch (e) { c = null; }
   if (c){ DAILIES.set(date, c); return c; }
   const st = { building: true, progress: 0 }; DAILIES.set(date, st);
@@ -990,9 +1218,10 @@ window.addEventListener('keydown', e => {
     if (k >= '1' && k <= '3' && COURSES[k - 1]) openBoard(COURSES[k - 1]);
     if (k === '4') mpEnter();
     if (k === 'n'){ e.preventDefault(); openName(); }
-    if (k === 'l') openLab();
+    if (k === 'l') openLabList();
     return;
   }
+  if (state === 'lab'){ if (k === 'm' || k === 'escape') toMenu(); return; }
   if (state === 'board'){
     if (k === 'enter' || k === ' '){ e.preventDefault(); play(); }
     else if (k === 'w') boardAct('watch');
@@ -1009,7 +1238,7 @@ window.addEventListener('keydown', e => {
   if (k === 'm') toMenu();
   if (k === 'b' || k === 'escape') openBoard(course);
   if (k === 'g') ghostOn = !ghostOn;
-  if (k === 'l' && course.lab){ SHAKE.lens = !SHAKE.lens; toast('カーソル周りの固定 ' + (SHAKE.lens ? 'ON' : 'OFF')); }
+  if (k === 'l' && course.shakeLab){ SHAKE.lens = !SHAKE.lens; toast('カーソル周りの固定 ' + (SHAKE.lens ? 'ON' : 'OFF')); }
   if (state === 'done'){ if (k === 'w') watchLast(); if (k === 'c' && !course.lab) doShare(); }
 });
 // 振動の設定キー（どの画面でも効く）。V = 入/切、[ ] = 強さ。端末に覚えておく
@@ -1021,9 +1250,36 @@ function shakeKey(k){
 
 function toMenu(){ state = 'menu'; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
 function play(){ state = 'title'; H.line3.hidden = false; restart(); }
-function openLab(){ course = LAB; ROOMS = LAB.rooms; START = LAB.start; best = null; play(); }
+// ---- 要素ラボ ----
+function openLabList(){ state = 'lab'; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
+function openLab(i){ // i 番目の要素の部屋を走る（省略時は SK-1）
+  const e = LABS[i || 0];
+  course = { id: 'lab-' + e.code, name: e.code + ' ' + e.name, desc: e.desc, lab: true, shakeLab: !!e.shake, medals: [0, 0, 0], start: { x: 90, y: 360 }, rooms: e.rooms };
+  ROOMS = course.rooms; START = course.start; best = null; play();
+}
+function labCards(){ const cols = 4, w = 296, h = 88, gap = 12, x0 = (T.W - (cols * w + (cols - 1) * gap)) / 2; return LABS.map((e, i) => ({ e, i, x: x0 + (i % cols) * (w + gap), y: 150 + Math.floor(i / cols) * (h + gap), w, h })); }
+function labUpdate(now, dt){
+  uiCursor(now);
+  for (const p of clicks){ const c = labCards().find(q => inRect(p, q)); if (c){ openLab(c.i); break; } }
+  clicks.length = 0; ups.length = 0;
+  if (state !== 'lab') return;
+  H.time.textContent = ''; H.room.textContent = ''; H.name.textContent = '';
+  draw(now, null, [], 0);
+}
+const LAB_COLORS = { SK: '#ffd044', DM: '#ff3b5c', MV: '#ff9f43', TR: '#b980ff', FX: '#4fd3ff' }; // 番号の頭2文字（種類）ごとの色
+function drawLab(now){
+  text('LAB', 20, 62, 46, C.fg); text('要素を1つずつ試す。記録は残らない', 150, 68, 16, C.dim, 'left', 500);
+  text('DM 弾幕 · MV 移動物 · TR トラップ · FX 見え方 · SK 演出　　NEW = 図鑑に無かった新案', 20, 112, 13, C.dim, 'left', 500);
+  for (const c of labCards()){
+    const hover = have && inRect(cur, c), col = LAB_COLORS[c.e.code.slice(0, 2)] || C.fg;
+    ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2; ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, c.h, 10); ctx.fill(); ctx.stroke();
+    text(c.e.code, c.x + 16, c.y + 26, 15, col); text(c.e.name, c.x + 84, c.y + 26, 19, C.fg);
+    if (c.e.isNew) text('NEW', c.x + c.w - 16, c.y + 26, 12, C.start, 'right');
+    text(c.e.desc, c.x + 16, c.y + 62, 13, C.dim, 'left', 500);
+  }
+}
 function restart(){
-  if (state === 'menu' || state === 'board' || state === 'watch' || state === 'mp') return;
+  if (state === 'menu' || state === 'board' || state === 'lab' || state === 'watch' || state === 'mp') return;
   state = 'title'; roomIdx = 0; cp = START; cpsHit = new Set(); deaths = 0; splits = []; elapsed = 0; deathMark = null; roomDeaths = ROOMS.map(() => 0);
   gRec = []; gLastT = -1; trail = []; particles = []; maxSpeed = 0; falseStarts = 0; history = []; resetPieceState(); raceGhosts = buildRaceGhosts(); setMsg();
 }
@@ -1065,7 +1321,8 @@ function fmt(t){ return t.toFixed(2); }
 function esc(s){ return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])); }
 const MEDAL_COLORS = { GOLD: '#ffd044', SILVER: '#cfd8e6', BRONZE: '#d08a4c' };
 const KEYS = {
-  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前 · L 振動ラボ',
+  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前 · L ラボ',
+  lab: 'カードをクリックして試す · M メニュー',
   board: 'Enter スタート · W リプレイ · C 結果をコピー · N 名前 · M メニュー',
   run: 'R リスタート · B ランキング · G ゴースト · V 振動 · M メニュー',
   watch: 'Space 一時停止 · ←→ 1秒(Shiftで5秒) · ↑↓ 切替 · 1/2/3 速度 · B 戻る',
@@ -1074,7 +1331,9 @@ function setMsg(isBest){
   msgVer = NET.ver;
   H.keys.textContent = state === 'mp' ? '' : KEYS[state] || KEYS.run;
   if (state === 'menu') H.msg.innerHTML = '<p>カードをクリックして選ぶ</p>';
-  else if (state === 'title' && course.lab) H.msg.innerHTML = '<h1>SK-1 SHAKE LAB</h1><p>レーザーの照射や叩きつけの瞬間に画面が揺れる。揺れるのは見た目だけで、カーソルの位置と当たり判定は動かない。</p><p>カーソルの周りは揺らさない絵（判定どおり）を出している。L で切り替えて見比べられる。記録は残らない。</p>';
+  else if (state === 'lab') H.msg.innerHTML = '';
+  else if (state === 'title' && course.shakeLab) H.msg.innerHTML = '<h1>SK-1 画面の振動</h1><p>レーザーの照射や叩きつけの瞬間に画面が揺れる。揺れるのは見た目だけで、カーソルの位置と当たり判定は動かない。</p><p>カーソルの周りは揺らさない絵（判定どおり）を出している。L で切り替えて見比べられる。B でラボの一覧に戻る。</p>';
+  else if (state === 'title' && course.lab) H.msg.innerHTML = `<h1>${esc(course.name)}</h1><p>${esc(course.desc)}。緑のパッドに置くとスタート。</p><p>記録は残らない。B でラボの一覧に戻る。</p>`;
   else if (state === 'title') H.msg.innerHTML = `<h1>${esc(course.name)}</h1><p>緑のパッドにカーソルを置くとカウントダウン。壁と赤いものに触れたら直前のパッドへ戻る。部屋の外に出ても死ぬ。</p><p>GOLD ${course.medals[0]}s · SILVER ${course.medals[1]}s · BRONZE ${course.medals[2]}s</p>`;
   else if (state === 'done'){
     const rows = splits.map((s, i) => `<span>${esc(ROOMS[i].name)}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}</span>`).join('');
@@ -1084,7 +1343,7 @@ function setMsg(isBest){
     const key = boardKey(course), all = boardRows(course).filter(r => !r.bot), me = all.find(r => r.me);
     const rank = NET.mode !== 'local' && canRank(course) && netRows(key) && me ? `<span>rank</span><span>#${me.rank} / ${all.length}人</span>` : '';
     const note = course.daily && !canRank(course) ? '<p>過去のデイリーは練習扱い（ランキングには載りません）</p>' : '';
-    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span>${rank}</div>${note}<div class="acts"><button type="button" class="go" data-act="retry">R リスタート</button><button type="button" data-act="watch">W 今の走りを見る</button><button type="button" data-act="share">C 結果をコピー</button><button type="button" data-act="board">B ランキング</button></div>`;
+    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span>${rank}</div>${note}<div class="acts"><button type="button" class="go" data-act="retry">R リスタート</button><button type="button" data-act="watch">W 今の走りを見る</button>${course.lab ? '' : '<button type="button" data-act="share">C 結果をコピー</button>'}<button type="button" data-act="board">${course.lab ? 'B ラボに戻る' : 'B ランキング'}</button></div>`;
   } else H.msg.innerHTML = '';
 }
 // 結果画面のボタン（キーでも同じことができる）
@@ -1143,6 +1402,7 @@ function update(now){
   if (toastT && now > toastT){ toastT = 0; H.toast.hidden = true; }
   if (state === 'mp'){ mpUpdate(now, dt); return; }
   if (state === 'board'){ boardUpdate(now, dt); return; }
+  if (state === 'lab'){ labUpdate(now, dt); return; }
   if (state === 'watch'){ watchUpdate(now, dt); return; }
   if (state === 'done' && msgVer !== NET.ver) setMsg(doneBest); // 順位が届いたら結果表示を更新
   if (state === 'race' || state === 'dead') elapsed = (now - goTime) / 1000;
@@ -1171,7 +1431,7 @@ function update(now){
     if (dc && NET.mode === 'api' && now > BOARD.menuPollAt){ BOARD.menuPollAt = now + 30000; netBoard(boardKey(dc)); }
     for (const c of clicks){
       if (inRect(c, menuNameChip())){ openName(); break; }
-      if (inRect(c, menuLabChip())){ openLab(); break; }
+      if (inRect(c, menuLabChip())){ openLabList(); break; }
       for (const card of menuCards()) if (state === 'menu' && inRect(c, card)){ if (card.kind === 'course') openBoard(card.c); else if (card.kind === 'daily') openDaily(td); else mpEnter(); }
     }
   }
@@ -1390,7 +1650,7 @@ function menuLabChip(){ return { x: 15, y: 582, w: 290, h: 40 }; }
 function drawMenu(now){
   text('CURSOR RUN', 15, 68, 46, C.fg);
   const nc = menuNameChip(); chip(nc, '名前  ' + myName() + '  ✎', have && inRect(cur, nc));
-  const lc = menuLabChip(); chip(lc, 'SK-1 画面の振動を試す（L）', have && inRect(cur, lc));
+  const lc = menuLabChip(); chip(lc, `LAB 要素を試す（L）· ${LABS.length}個`, have && inRect(cur, lc));
   for (const card of menuCards()){
     const hover = have && inRect(cur, card);
     ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : card.kind === 'daily' ? C.exit : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2;
@@ -1447,13 +1707,42 @@ function drawPieces(pieces, ps, t){
     if (p.t === 'rain'){ ctx.globalAlpha = 0.25; ctx.fillRect(p.x, 0, p.w, 6); ctx.globalAlpha = 0.05; ctx.fillRect(p.x, 0, p.w, T.H); }
     if (p.t === 'mine'){ ctx.globalAlpha = 0.12; ctx.setLineDash([3, 5]); ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(p.x, p.y, p.trigger, 0, TAU); ctx.stroke(); ctx.setLineDash([]); }
     if (p.t === 'warnfloor'){ const ph = frac(t / p.period + (p.phase || 0)), warn = ph > 1 - p.warn / p.period && ph >= p.duty; ctx.globalAlpha = warn ? 0.4 + 0.5 * Math.abs(Math.sin(t * 25)) : 0.2; ctx.lineWidth = warn ? 4 : 2; ctx.setLineDash(warn ? [] : [6, 6]); ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.setLineDash([]); ctx.lineWidth = 1; }
+    // ---- 第2弾: 通り道や動く範囲のガイド ----
+    if (p.t === 'patrol'){ ctx.globalAlpha = 0.18; ctx.setLineDash([6, 8]); ctx.beginPath(); p.pts.forEach((q, i) => i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1])); ctx.closePath(); ctx.stroke(); ctx.setLineDash([]); }
+    if (p.t === 'train'){ ctx.globalAlpha = 0.18; ctx.setLineDash([6, 8]); ctx.beginPath(); ctx.arc(p.x, p.y, p.R, 0, TAU); ctx.stroke(); ctx.setLineDash([]); }
+    if (p.t === 'breathe'){ ctx.globalAlpha = 0.15; ctx.setLineDash([4, 6]); ctx.strokeRect(p.x - p.w / 2, p.y - p.h / 2, p.w, p.h); ctx.setLineDash([]); }
+    if ((p.t === 'ball' || p.t === 'bounce') && p.box){ ctx.globalAlpha = 0.14; ctx.setLineDash([4, 8]); ctx.strokeRect(p.box[0], p.box[1], p.box[2] - p.box[0], p.box[3] - p.box[1]); ctx.setLineDash([]); }
+    if (p.t === 'gapwall'){ ctx.globalAlpha = 0.05; ctx.fillRect(p.x - p.dx / 2 - p.w / 2, 0, p.dx + p.w, T.H); ctx.globalAlpha = 0.22; ctx.setLineDash([4, 8]); ctx.strokeRect(p.x - p.dx / 2 - p.w / 2, p.gy - p.gh / 2, p.dx + p.w, p.gh); ctx.setLineDash([]); } // 掃く範囲と、すき間が通る帯
+    if (p.t === 'serpent'){ ctx.globalAlpha = 0.04; if (p.vert) ctx.fillRect(p.x - p.amp - p.r, 0, 2 * (p.amp + p.r), T.H); else ctx.fillRect(0, p.y - p.amp - p.r, T.W, 2 * (p.amp + p.r)); }
   }
   ctx.restore();
+  for (const p of pieces){
+    if (p.t === 'fakewall'){ ctx.fillStyle = C.wall; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.save(); ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.setLineDash([5, 3]); ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2); ctx.restore(); } // 縁が破線＝偽物
+    else if (p.t === 'ghostwall'){ // 見ている人（カーソル）に近いほど濃く見える。縮小図では薄く見せておく
+      const c = VIEW_C, dx = c ? Math.max(p.x - c.x, 0, c.x - p.x - p.w) : 1e9, dy = c ? Math.max(p.y - c.y, 0, c.y - p.y - p.h) : 1e9, a = THUMB ? 0.3 : Math.max(0, 1 - Math.hypot(dx, dy) / Math.max(1, p.reveal));
+      ctx.save(); ctx.globalAlpha = 0.04 + 0.85 * a; ctx.fillStyle = C.wall; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2); ctx.restore(); }
+    else if (p.t === 'flood'){ // 島は常に見える。予告で縁が点滅し、浸水中は島の外が赤く染まる
+      const st = floodState(p, t), holes = () => { ctx.beginPath(); ctx.rect(-40, -40, T.W + 80, T.H + 80); for (const q of p.isl){ ctx.moveTo(q[0] + q[2], q[1]); ctx.arc(q[0], q[1], q[2], 0, TAU); } };
+      ctx.save();
+      if (st.on){ holes(); ctx.fillStyle = C.haz; ctx.globalAlpha = 0.42; ctx.fill('evenodd'); }
+      else if (st.warn){ holes(); ctx.fillStyle = C.haz; ctx.globalAlpha = 0.07 + 0.07 * Math.sin(t * 28); ctx.fill('evenodd'); }
+      for (const q of p.isl){ ctx.beginPath(); ctx.arc(q[0], q[1], q[2], 0, TAU); ctx.globalAlpha = st.on ? 1 : st.warn ? 0.6 + 0.4 * Math.sin(t * 28) : 0.4; ctx.strokeStyle = C.start; ctx.lineWidth = st.on ? 3 : 2; ctx.setLineDash(st.on ? [] : [6, 6]); ctx.stroke(); }
+      ctx.restore(); }
+  }
   for (const p of pieces){
     if (p.t === 'speedzone') zoneBox(p, C.cp, `≤ ${p.limit} px/s`);
     if (p.t === 'nostop'){ const s = stateOf(p), f = Math.min(1, (s.acc || 0) / p.grace); zoneBox(p, f > 0 ? C.haz : C.cp, `≥ ${p.min} px/s 止まるな`); }
   }
+  // 小さい弾は数が多いので、まとめて1回で塗る（1個ずつ光らせると重い）
+  let small = 0; ctx.beginPath();
+  for (const pr of ps) if (pr.k === 'circ' && pr.r <= 9){ ctx.moveTo(pr.x + pr.r, pr.y); ctx.arc(pr.x, pr.y, pr.r, 0, TAU); small++; }
+  if (small){ ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 10; ctx.fillStyle = C.haz; ctx.fill(); ctx.restore(); }
   for (const pr of ps){
+    if (pr.k === 'safe' || pr.c === 'hidden' || (pr.k === 'circ' && pr.r <= 9)) continue; // 浸水・透明壁は別に描く。小さい弾は上で描いた
+    if (pr.k === 'arc'){ // すき間のある輪: 区画ごとに、すき間を除いた弧を描く
+      const sec = TAU / pr.n; ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.strokeStyle = C.haz; ctx.lineWidth = pr.r * 2; ctx.lineCap = 'butt';
+      for (let i = 0; i < pr.n; i++){ ctx.beginPath(); ctx.arc(pr.x, pr.y, pr.R, pr.a0 + i * sec + pr.gap, pr.a0 + (i + 1) * sec); ctx.stroke(); }
+      ctx.restore(); continue; }
     if (pr.k === 'rect'){
       if (pr.c === 'wall'){ ctx.fillStyle = C.wall; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.strokeRect(pr.x + 1, pr.y + 1, pr.w - 2, pr.h - 2); }
       else if (pr.c === 'blink' || pr.c === 'warn'){
@@ -1486,6 +1775,8 @@ function drawPieces(pieces, ps, t){
         ctx.moveTo(ax + nx, ay + ny); ctx.lineTo(bx + nx, by + ny); ctx.moveTo(ax - nx, ay - ny); ctx.lineTo(bx - nx, by - ny); ctx.stroke();
       }
       ctx.restore(); hub(p.x, p.y, Math.atan2(st.dy, st.dx), true); }
+    else if (p.t === 'danmaku') hub(p.x, p.y, ((p.aim || 0) + Math.floor(t / p.interval) * (p.spin || 0)) * DEG, p.pattern === 'fan');
+    else if (p.t === 'bounce' || p.t === 'burst') hub(p.x, p.y, 0, false);
     else if (p.t === 'aimed'){ const s = stateOf(p), last = s.b && s.b.length ? s.b[s.b.length - 1] : null; hub(p.x, p.y, last ? Math.atan2(last.vy, last.vx) : 0, true); }
     else if (p.t === 'mine'){ const s = stateOf(p), ph = s.ph || 'idle'; ctx.save(); ctx.beginPath(); ctx.arc(p.x, p.y, 10, 0, TAU); ctx.fillStyle = ph === 'cool' ? '#3a2a30' : '#5a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.globalAlpha = ph === 'cool' ? 0.3 : 1; ctx.stroke();
       if (ph === 'armed'){ ctx.globalAlpha = 0.4 + 0.4 * Math.sin(t * 40); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, p.y, p.blast, 0, TAU); ctx.stroke(); } ctx.restore(); }
@@ -1504,7 +1795,7 @@ function drawSingle(now, room, ps, ht, layer){
       head(cur.x, cur.y, state === 'dead' ? C.ghost : C.player, 1, state === 'dead');
       if (debug){ ctx.beginPath(); ctx.arc(cur.x, cur.y, T.HEAD_R, 0, TAU); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
     }
-    if (course.lab){ // ラボ: いまの設定と操作
+    if (course.shakeLab){ // 振動ラボ: いまの設定と操作
       panel(330, 664, 620, 40);
       text(`振動 ${SHAKE.on ? 'ON' : 'OFF'} · 強さ ×${SHAKE.gain.toFixed(2)} · カーソル周りの固定 ${SHAKE.lens ? 'ON' : 'OFF'}`, 350, 685, 14, C.fg, 'left', 500);
       text('V 振動 · [ ] 強さ · L 固定', 930, 685, 13, C.dim, 'right', 500);
@@ -1634,7 +1925,7 @@ const GHOST_COLORS = ['#ffb14a', '#b980ff', '#49e07c', '#ff7ab8', '#7cf5d6'], BO
 const BOARD = { sel: new Map(), scroll: 0, pollAt: 0, menuPollAt: 0, pending: null }; // sel: コース(キー) → 並走相手の pid の並び
 const BL = { x: 500, y: 150, w: 740, rh: 34, max: 11 }; // 順位表の位置と行数
 function openBoard(c){
-  if (c.lab){ toMenu(); return; } // ラボにランキングは無い
+  if (c.lab){ openLabList(); return; } // ラボにランキングは無い。一覧へ戻る
   course = c; ROOMS = c.rooms; START = c.start; best = loadBest(c); state = 'board'; BOARD.scroll = 0; BOARD.pollAt = 0; BOARD.pending = null; trail = []; particles = []; H.line3.hidden = true;
   ensureBot(c); syncRec(c); setMsg();
 }
@@ -1755,7 +2046,7 @@ function drawBoard(now){
     ctx.save(); ctx.beginPath(); ctx.rect(tx, ty, tw, th); ctx.clip(); ctx.fillStyle = C.arena; ctx.fillRect(tx, ty, tw, th); ctx.translate(tx, ty); ctx.scale(sc, sc);
     pad(entry.x, entry.y, T.PAD_R, i ? C.cp : C.start, '', true); for (const q of room.cps) pad(q.x, q.y, T.PAD_R, C.cp, '', false);
     if (i === n - 1) goal(room.exit.x, room.exit.y, T.PAD_R); else pad(room.exit.x, room.exit.y, T.PAD_R, C.exit, '', true);
-    drawPieces(room.pieces, prims(room, t), t); ctx.restore();
+    THUMB = true; drawPieces(room.pieces, prims(room, t), t); THUMB = false; ctx.restore();
     ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 1; ctx.strokeRect(tx + 0.5, ty + 0.5, tw - 1, th - 1);
     const label = roomLabel(room);
     ctx.fillStyle = 'rgba(7,9,15,0.78)'; ctx.fillRect(tx + 1, ty + 1, Math.min(tw - 2, 22 + label.length * 8.5), 20); text((i + 1) + ' ' + label, tx + 7, ty + 11, 12, C.fg, 'left', 500);
@@ -1867,9 +2158,28 @@ function shakeNow(room, ht, level){
   const sh = pieces ? shakeOffset(roomShake(pieces, t), t) : { x: 0, y: 0, amp: 0 };
   sh.c = c; return sh;
 }
+// 暗闇・霧（見た目だけの効果）。部屋の上・カーソルの下に描く。かかるのは走っている間だけで、スタート前は全体が見える。
+function fxNow(room, level){
+  const has = ps => ps.some(p => p.t === 'dark' || p.t === 'fog');
+  const pads = (rm, ri) => { const e = roomEntry(ri); return [[e.x, e.y, ri ? C.cp : C.start, ri ? 'IN' : 'START'], ...rm.cps.map(c => [c.x, c.y, C.cp, 'CP']), [rm.exit.x, rm.exit.y, C.exit, ri === ROOMS.length - 1 ? null : 'EXIT']]; };
+  if ((state === 'race' || state === 'dead') && has(room.pieces)) return { pieces: room.pieces, pads: pads(room, roomIdx) };
+  if (state === 'watch'){ const v = watchView(); if (has(v.room.pieces)) return { pieces: v.room.pieces, pads: pads(v.room, v.ri) }; }
+  if (state === 'mp' && MP.snap && MP.snap.phase === 'run' && has(level)) return { pieces: level, pads: [[MP_START.x, MP_START.y, C.start, 'START'], [MP_GOAL.x, MP_GOAL.y, C.exit, null]] };
+  return null;
+}
+function drawFx(f, c){
+  let dark = false;
+  for (const p of f.pieces){
+    if (p.t === 'dark'){ dark = true; const x = c ? c.x : -9999, y = c ? c.y : -9999, g = ctx.createRadialGradient(x, y, p.radius * 0.55, x, y, p.radius); g.addColorStop(0, 'rgba(5,7,12,0)'); g.addColorStop(1, 'rgba(5,7,12,0.97)'); ctx.fillStyle = g; ctx.fillRect(-40, -40, T.W + 80, T.H + 80); }
+    else if (p.t === 'fog'){ ctx.save(); ctx.beginPath(); ctx.rect(p.x, p.y, p.w, p.h); ctx.clip(); ctx.beginPath(); ctx.rect(p.x, p.y, p.w, p.h); if (c){ ctx.moveTo(c.x + p.reveal, c.y); ctx.arc(c.x, c.y, p.reveal, 0, TAU); } ctx.fillStyle = 'rgba(28,36,56,0.96)'; ctx.fill('evenodd'); ctx.restore();
+      ctx.save(); ctx.strokeStyle = C.cp; ctx.globalAlpha = 0.4; ctx.lineWidth = 2; ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.restore(); }
+  }
+  // 暗闇でもパッド（入口・チェックポイント・出口）の場所だけは見せる
+  if (dark) for (const [x, y, col, label] of f.pads){ if (label === null) goal(x, y, T.PAD_R); else pad(x, y, T.PAD_R, col, label, false); }
+}
 function draw(now, room, ps, ht, level, env){
   const { s, ox, oy, dpr } = view, base = () => ctx.setTransform(dpr * s, 0, 0, dpr * s, ox * dpr, oy * dpr);
-  const ui = state === 'menu' || state === 'board';
+  const ui = state === 'menu' || state === 'board' || state === 'lab';
   // 揺れる層: 格子と部屋
   const world = () => {
     const m = 40; // ずらしても端が欠けないよう、地と格子は部屋の少し外まで描く
@@ -1881,6 +2191,7 @@ function draw(now, room, ps, ht, level, env){
     if (state === 'watch') drawWatch(now, 'world'); else if (state === 'mp') drawMulti(now, ps, ht, level || [], 'world'); else if (!ui) drawSingle(now, room, ps, ht, 'world');
   };
   const sh = ui ? { x: 0, y: 0, amp: 0 } : shakeNow(room, ht, level || []);
+  VIEW_C = ui ? null : sh.c;
   ctx = mainCtx; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cvs.width, cvs.height);
   base();
@@ -1905,9 +2216,10 @@ function draw(now, room, ps, ht, level, env){
     }
     base();
   } else world();
+  if (!ui){ const f = fxNow(room, level || []); if (f) drawFx(f, sh.c); }
   // 揺れない層: カーソルと表示類
   if (ui || state === 'watch'){
-    if (state === 'menu') drawMenu(now); else if (state === 'board') drawBoard(now); else drawWatch(now, 'over');
+    if (state === 'menu') drawMenu(now); else if (state === 'board') drawBoard(now); else if (state === 'lab') drawLab(now); else drawWatch(now, 'over');
     // リプレイ中は見ている人のカーソルを輪にする（再生中の自機と見分けるため）
     if (state === 'watch'){ if (have){ ctx.beginPath(); ctx.arc(cur.x, cur.y, 7, 0, TAU); ctx.strokeStyle = C.fg; ctx.lineWidth = 2; ctx.stroke(); } }
     else { drawTrail(trail, C.player, 0.9, now); if (have) head(cur.x, cur.y, C.player, 1, false); }

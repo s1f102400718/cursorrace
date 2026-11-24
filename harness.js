@@ -28,4 +28,25 @@ function load(names, opts = {}){
   const m = new Function(...Object.keys(env), src)(...Object.values(env));
   return { m, clock, store, errors };
 }
-module.exports = { load };
+// BOT（ソルバー）の経路を部屋の並びぶん求める。解けない部屋があれば { fail: 部屋番号 }。m には solveRoom が要る
+function botPath(m, rooms, start){
+  const bot = []; let t = 0, pos = start;
+  for (let i = 0; i < rooms.length; i++){
+    const s = m.solveRoom(rooms[i], pos, rooms[i].exit, t, true, 40); if (!s.ok) return { fail: i };
+    for (const p of s.path) bot.push(Math.round(p.t * 1000), i, p.x, p.y, 1);
+    t += s.time; pos = s.path[s.path.length - 1];
+  }
+  return { bot, time: t };
+}
+// コースを開いた直後（state が 'title'）から、BOT の経路を本物のゲームループに流す。m には samples, update, state が要る
+function runBot(m, clock, bot){
+  m.samples.push({ x: bot[2], y: bot[3] }); clock.t += 16; m.update(clock.t);
+  for (let i = 0; i < 400 && m.state === 'count'; i++){ clock.t += 16; m.update(clock.t); }
+  if (m.state !== 'race') return false;
+  const t0 = clock.t; let last = -1;
+  for (let i = 0; i < bot.length && m.state === 'race'; i += 5){ if (bot[i] === last) continue; last = bot[i]; clock.t = t0 + bot[i]; m.samples.push({ x: bot[i + 2], y: bot[i + 3] }); m.update(clock.t); }
+  return m.state === 'done';
+}
+// パッドの中心と縁16点（半径1に正規化）。パッド上のカーソルが当たらないことを確かめるのに使う
+const RIM = [[0, 0], ...Array.from({ length: 16 }, (_, i) => [Math.cos(i / 16 * Math.PI * 2), Math.sin(i / 16 * Math.PI * 2)])];
+module.exports = { load, botPath, runBot, RIM };
