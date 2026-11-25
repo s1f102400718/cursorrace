@@ -7,7 +7,7 @@
 const { load, botPath, runBot, RIM } = require('./harness.js');
 let fail = 0; const ok = (c, msg) => { if (!c){ fail++; console.log('  NG', msg); } return c; };
 const NAMES = ['T', 'LABS', 'ARCH', 'MODS', 'ARCH_SINCE', 'MOD_SINCE', 'prims', 'hit', 'sweepHit', 'solveRoom', 'padSafe', 'bounds', 'materialize', 'placementOk', 'translate', 'fold', 'buildDaily', 'genVer', 'dayShift', 'roomLabel',
-  'openLab', 'openLabList', 'update', 'samples', 'clicks', 'state', 'deaths', 'course', 'ctx', 'mainCtx'];
+  'openLab', 'openLabList', 'update', 'samples', 'clicks', 'state', 'deaths', 'course', 'ctx', 'mainCtx', 'lightProj', 'lightDir'];
 
 (() => {
   const { m } = load(NAMES);
@@ -73,6 +73,19 @@ const NAMES = ['T', 'LABS', 'ARCH', 'MODS', 'ARCH_SINCE', 'MOD_SINCE', 'prims', 
   const newA = Object.keys(m.ARCH_SINCE).filter(k => seenA.has(k)), newM = Object.keys(m.MOD_SINCE).filter(k => seenM.has(k));
   ok(fb === 0, `予備部屋 ${fb}`); ok(newA.length >= 9, '新しい型がほとんど出ない: ' + newA); ok(newM.length >= 7, '新しい上乗せがほとんど出ない: ' + newM);
   console.log(`   新しい型 ${newA.length}/${Object.keys(m.ARCH_SINCE).length} 種、上乗せ ${newM.length}/${Object.keys(m.MOD_SINCE).length} 種が出た`);
+
+  console.log('6) 立体表示（光源と影）');
+  const Lg = m.T.LIGHT, sh = (x, y, h) => { const p = m.lightProj(x, y, h); return [p[0] - x, p[1] - y]; };
+  ok(Lg.Y < 0 && Lg.X === m.T.W / 2, '光源がフィールドの外・中央の上に無い');
+  const sl = sh(200, 400, 40), sr = sh(1080, 400, 40), sc = sh(640, 400, 40);
+  ok(sl[0] < 0 && sl[1] > 0 && sr[0] > 0 && sr[1] > 0 && Math.abs(sc[0]) < 1e-9 && sc[1] > 0, '影が光源と反対の向き（左の物は左下、右の物は右下、真下の物は下）へ伸びない');
+  ok(Math.hypot(...sh(200, 650, 40)) > Math.hypot(...sh(200, 100, 40)) && Math.hypot(...sh(200, 400, 60)) > Math.hypot(...sl), '影が 遠いほど・高いほど 長くならない');
+  const d1 = m.lightDir(200, 600), d2 = m.lightDir(1080, 600); ok(d1[0] > 0 && d1[1] < 0 && d2[0] < 0 && d2[1] < 0, '光の当たる向き');
+  // 立体表示は見た目だけ: 入/切で同じ入力から同じ結果になる
+  const runLook = depth => { const G = load([...NAMES, 'LOOK', 'finalTime', 'lastRun']); G.m.LOOK.depth = depth; const e = G.m.LABS.findIndex(q => q.code === 'MV-4'), b = botPath(G.m, G.m.LABS[e].rooms, { x: 90, y: 360 }); G.m.openLab(e); const done = runBot(G.m, G.clock, b.bot); return { done, t: G.m.finalTime, d: G.m.deaths, rec: JSON.stringify(G.m.lastRun && G.m.lastRun.s), err: G.errors.length }; };
+  const on = runLook(true), off = runLook(false);
+  ok(on.done && off.done && on.t === off.t && on.d === 0 && off.d === 0 && on.rec === off.rec, '立体表示の入/切で結果が変わった');
+  ok(on.err === 0 && off.err === 0, '立体表示の描画で例外');
 
   console.log(fail ? `ELEMENTS FAIL ${fail}` : 'ELEMENTS OK');
   process.exit(fail ? 1 : 0);

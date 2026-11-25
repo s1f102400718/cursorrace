@@ -4,7 +4,7 @@ const WebSocket = require('ws');
 const PORT = 8124;
 const html = fs.readFileSync(__dirname + '/index.html', 'utf8');
 const js = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
-const el = () => ({ textContent: '', innerHTML: '', hidden: false, addEventListener(){}, getContext: () => new Proxy({ roundRect: () => {} }, { get: (t, k) => k in t ? t[k] : k === 'measureText' ? () => ({ width: 0 }) : () => {} }), width: 0, height: 0 });
+const el = () => ({ textContent: '', innerHTML: '', hidden: false, addEventListener(){}, getContext: () => new Proxy({ roundRect: () => {} }, { get: (t, k) => k in t ? t[k] : k === 'measureText' ? () => ({ width: 0 }) : k === 'createRadialGradient' || k === 'createLinearGradient' ? () => ({ addColorStop(){} }) : () => {} }), width: 0, height: 0 });
 global.document = { getElementById: el, documentElement: {}, addEventListener(){} };
 global.window = { innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1, addEventListener(){} };
 global.getComputedStyle = () => ({ getPropertyValue: () => '#000' });

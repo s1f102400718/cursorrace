@@ -76,8 +76,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await page.mouse.click(WLX(0.62), 692); await sleep(300); // タイムラインをクリックしてシーク
   await shot('08-replay-seek');
   await page.keyboard.press('b'); await until(() => state === 'board');
-  await page.keyboard.press('ArrowLeft'); await sleep(400); // 初日なので「前の日」は無効のはず
-  await page.keyboard.press('m'); await until(() => state === 'menu'); await page.mouse.move(700, 620); await sleep(500);
+  await page.keyboard.press('ArrowLeft'); await sleep(60); // 「前の日」を押し、生成を待たずにメニューへ戻る（予約が取り消されて、勝手にランキングへ飛ばないこと）
+  await page.keyboard.press('m'); await until(() => state === 'menu'); await page.mouse.move(700, 620); await sleep(2500);
+  if (await st() !== 'menu') errors.push('メニューに戻ったのに、生成が終わってランキングへ飛ばされた');
   await shot('09-menu-after');
   await page.keyboard.press('2'); await until(() => state === 'board' && course.id === 'hard' && course.bot && course.bot.length > 0); await page.mouse.move(300, 300); await sleep(500);
   await shot('10-board-hard');

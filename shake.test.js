@@ -76,7 +76,7 @@ function runLab(shakeOn){
     ok(A.ctxLeak === 0, '描画先が画面に戻っていない'); ok(A.errors.length === 0 && B.errors.length === 0, '例外: ' + A.errors.concat(B.errors).slice(0, 2).join('\n'));
     A.m.watchLast(); for (let i = 0; i < 120; i++){ A.clock.t += 16; A.m.update(A.clock.t); } // リプレイ中も揺れる（中心は追っている走り）
     ok(A.m.state === 'watch' && A.errors.length === 0 && A.m.ctx === A.m.mainCtx, 'リプレイ中の描画: ' + A.errors[0]);
-    ok(A.m.shakeKey('v') && A.m.SHAKE.on === false && A.m.shakeKey(']') && A.m.SHAKE.gain === 1.25 && !A.m.shakeKey('x'), '設定キー');
+    ok(A.m.shakeKey('v') && A.m.SHAKE.on === false && A.m.shakeKey(']') && A.m.SHAKE.gain === 1.25 && !A.m.shakeKey('q'), '設定キー');
   }
   // ラボのパッドがどの時刻でも安全か（時刻を回して確かめる）
   let padBad = 0; m.LAB.rooms.forEach((r, ri) => { const pads = [ri ? m.LAB.rooms[ri - 1].exit : m.LAB.start, r.exit, ...r.cps]; for (let t = 0; t < 30; t += 0.05){ const ps = m.prims(r, t); for (const p of pads) for (let a = -1; a < 16; a++){ const x = p.x + (a < 0 ? 0 : Math.cos(a / 16 * 6.2832) * m.T.PAD_R), y = p.y + (a < 0 ? 0 : Math.sin(a / 16 * 6.2832) * m.T.PAD_R); for (const pr of ps) if (m.hit(pr, x, y, x, y, m.T.HEAD_R)) padBad++; } } });

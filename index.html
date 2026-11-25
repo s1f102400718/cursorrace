@@ -82,6 +82,15 @@ const T = {
     DEFAULT: { beam: 7, rotlaser: 4, crusher: 5, mine: 9, flood: 6 }, // shake を書いていないピースの揺れ幅(px)。0 か未記載なら揺れない
     LENS_R0: 90, LENS_R1: 230, LENS_STEPS: 14,            // カーソルから R0 までは揺らさず、R1 にかけて段階的に揺れへつなぐ（段の数）
   },
+  // 立体表示の光源（見た目だけ。当たり判定には使わない）。フィールドの外、中央の上に置いてある
+  LIGHT: {
+    X: 640, Y: -220,           // 光源の位置（部屋の座標。Y が負 = 上の縁より外）
+    H: 520,                    // 光源の高さ。低いほど影が長く伸びる
+    WALL_H: 46, HAZ_H: 34,     // 壁と障害物の高さ。影の長さ = 光源からの距離 × 高さ ÷ (H − 高さ)
+    FRAME_H: 60,               // フィールドを囲む枠の高さ（上の枠が内側に影を落とす）
+    SHADOW: 0.5,               // 影の濃さ
+    BEVEL: 6,                  // ブロックの縁（斜めの面）の幅
+  },
 };
 const COURSE_VER = 'v0.2';
 
@@ -1244,14 +1253,16 @@ window.addEventListener('keydown', e => {
 // 振動の設定キー（どの画面でも効く）。V = 入/切、[ ] = 強さ。端末に覚えておく
 function shakeKey(k){
   if (k === 'v'){ SHAKE.on = !SHAKE.on; LS.set('cursorrun.shake', SHAKE.on ? '1' : '0'); toast('画面の振動 ' + (SHAKE.on ? 'ON' : 'OFF')); return true; }
+  if (k === 'x'){ LOOK.depth = !LOOK.depth; LS.set('cursorrun.depth', LOOK.depth ? '1' : '0'); toast('立体表示 ' + (LOOK.depth ? 'ON' : 'OFF')); return true; }
   if (k === '[' || k === ']'){ SHAKE.gain = Math.max(0.25, Math.min(2, Math.round((SHAKE.gain + (k === ']' ? 0.25 : -0.25)) * 100) / 100)); LS.set('cursorrun.shakeGain', SHAKE.gain); toast('振動の強さ ×' + SHAKE.gain.toFixed(2)); return true; }
   return false;
 }
 
-function toMenu(){ state = 'menu'; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
-function play(){ state = 'title'; H.line3.hidden = false; restart(); }
+// 画面を移るときは「生成が終わったら開く」の予約（BOARD.pending）を取り消す。そうしないと、移った先から勝手にランキングへ飛ばされる
+function toMenu(){ state = 'menu'; BOARD.pending = null; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
+function play(){ state = 'title'; BOARD.pending = null; H.line3.hidden = false; restart(); }
 // ---- 要素ラボ ----
-function openLabList(){ state = 'lab'; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
+function openLabList(){ state = 'lab'; BOARD.pending = null; trail = []; particles = []; H.line3.hidden = true; setMsg(); }
 function openLab(i){ // i 番目の要素の部屋を走る（省略時は SK-1）
   const e = LABS[i || 0];
   course = { id: 'lab-' + e.code, name: e.code + ' ' + e.name, desc: e.desc, lab: true, shakeLab: !!e.shake, medals: [0, 0, 0], start: { x: 90, y: 360 }, rooms: e.rooms };
@@ -1324,7 +1335,7 @@ const KEYS = {
   menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前 · L ラボ',
   lab: 'カードをクリックして試す · M メニュー',
   board: 'Enter スタート · W リプレイ · C 結果をコピー · N 名前 · M メニュー',
-  run: 'R リスタート · B ランキング · G ゴースト · V 振動 · M メニュー',
+  run: 'R リスタート · B ランキング · G ゴースト · V 振動 · X 立体 · M メニュー',
   watch: 'Space 一時停止 · ←→ 1秒(Shiftで5秒) · ↑↓ 切替 · 1/2/3 速度 · B 戻る',
 };
 function setMsg(isBest){
@@ -1612,6 +1623,8 @@ function drawTrail(tr, color, alpha, now){
   ctx.restore();
 }
 function head(x, y, color, alpha, hollow){
+  if (LOOK.depth && !hollow){ // カーソルは床から少し浮いている。光源と反対側の床に小さな影を落とす（位置の基準はあくまで本体）
+    const s = lightProj(x, y, 7); ctx.save(); ctx.globalAlpha = alpha * T.LIGHT.SHADOW; ctx.fillStyle = '#02040a'; ctx.beginPath(); ctx.arc(s[0], s[1], 7, 0, TAU); ctx.fill(); ctx.restore(); }
   ctx.save(); ctx.globalAlpha = alpha;
   ctx.shadowColor = color; ctx.shadowBlur = hollow ? 0 : 18;
   ctx.beginPath(); ctx.arc(x, y, 8, 0, TAU);
@@ -1693,6 +1706,99 @@ function drawMenu(now){
 // ピース群の描画（ガイド → 本体 → 砲台の台座）
 function zoneBox(p, color, label){ ctx.save(); ctx.fillStyle = color; ctx.globalAlpha = 0.08; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.globalAlpha = 0.6; ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([8, 6]); ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.setLineDash([]); ctx.globalAlpha = 1; text(label, p.x + 10, p.y + 14, 13, color); ctx.restore(); }
 function hub(x, y, a, aimed){ ctx.save(); ctx.translate(x, y); ctx.rotate(a); ctx.beginPath(); ctx.arc(0, 0, 14, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.exit; ctx.lineWidth = 3; ctx.stroke(); if (aimed){ ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(22, 0); ctx.stroke(); } ctx.restore(); }
+// ===================== 立体表示（光源・陰影・影） =====================
+// 光源はフィールドの外、中央の上（T.LIGHT）。物には光の当たる面と陰の面ができ、床には光源と反対の向きへ影が伸びる。
+// 見た目だけの処理で、当たり判定は変えない。物は「判定の形そのまま」に描き、影は床の上に落とす（影に触れても死なない）。
+const LOOK = { depth: true, noShadow: false }; // depth: 立体表示（X で切替）。noShadow: 箱の見本など、影を付けない描画の最中
+function lightDir(x, y){ const dx = T.LIGHT.X - x, dy = T.LIGHT.Y - y, d = Math.hypot(dx, dy) || 1; return [dx / d, dy / d]; } // その場所から光源への向き
+function lightProj(x, y, h){ const k = T.LIGHT.H / (T.LIGHT.H - h); return [T.LIGHT.X + (x - T.LIGHT.X) * k, T.LIGHT.Y + (y - T.LIGHT.Y) * k]; } // 高さ h にある点 (x,y) の影が床に落ちる位置
+// ブロック（壁・動く四角）: 縁を斜めの面に見立て、光のほうを向く面を明るく、背を向ける面を暗くする。外形は判定と同じ
+function block(x, y, w, h, mid, top, glow){
+  const b = Math.min(T.LIGHT.BEVEL, w / 3, h / 3), [dx, dy] = lightDir(x + w / 2, y + h / 2);
+  ctx.save(); if (glow){ ctx.shadowColor = glow; ctx.shadowBlur = 8; } ctx.fillStyle = mid; ctx.fillRect(x, y, w, h); ctx.restore();
+  const face = (l, pts) => { ctx.fillStyle = l > 0 ? '#fff' : '#000'; ctx.globalAlpha = Math.abs(l) * (l > 0 ? 0.5 : 0.5); ctx.beginPath(); ctx.moveTo(pts[0], pts[1]); for (let i = 2; i < 8; i += 2) ctx.lineTo(pts[i], pts[i + 1]); ctx.closePath(); ctx.fill(); };
+  ctx.save();
+  face(-dy, [x, y, x + w, y, x + w - b, y + b, x + b, y + b]);                // 上の縁（外向きの法線は上）
+  face(dy, [x, y + h, x + w, y + h, x + w - b, y + h - b, x + b, y + h - b]); // 下の縁
+  face(-dx, [x, y, x, y + h, x + b, y + h - b, x + b, y + b]);                // 左の縁
+  face(dx, [x + w, y, x + w, y + h, x + w - b, y + h - b, x + w - b, y + b]); // 右の縁
+  ctx.restore();
+  ctx.fillStyle = top; ctx.fillRect(x + b, y + b, w - 2 * b, h - 2 * b);
+}
+// 球: 光源側にハイライトを寄せたグラデーション
+function sphere(x, y, r){
+  const [dx, dy] = lightDir(x, y), g = ctx.createRadialGradient(x + dx * r * 0.42, y + dy * r * 0.42, r * 0.05, x, y, r);
+  g.addColorStop(0, '#ffd6dd'); g.addColorStop(0.4, C.haz); g.addColorStop(1, '#7d1530');
+  ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 8; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = g; ctx.fill(); ctx.restore();
+}
+// 円柱（回転バーなど）: 太さの中で、光源側に明るい筋、反対側に暗い地を残す
+function cylinder(ax, ay, bx, by, r){
+  let nx = -(by - ay), ny = bx - ax; const n = Math.hypot(nx, ny) || 1, [dx, dy] = lightDir((ax + bx) / 2, (ay + by) / 2); nx /= n; ny /= n;
+  const l = nx * dx + ny * dy, line = (off, w, col, a) => { ctx.globalAlpha = a; ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(ax + nx * off, ay + ny * off); ctx.lineTo(bx + nx * off, by + ny * off); ctx.stroke(); };
+  ctx.save(); ctx.lineCap = 'round'; ctx.shadowColor = C.haz; ctx.shadowBlur = 8; line(0, r * 2, '#8a1832', 1); ctx.shadowBlur = 0;
+  line(l * r * 0.2, r * 1.5, C.haz, 1); line(l * r * 0.5, Math.max(2, r * 0.32), '#ffd6dd', 0.75); ctx.restore();
+}
+// 床: 光源に近いほど明るい
+function litFloor(m){
+  const g = ctx.createRadialGradient(T.LIGHT.X, T.LIGHT.Y, 140, T.LIGHT.X, T.LIGHT.Y, 1320);
+  g.addColorStop(0, '#34446b'); g.addColorStop(0.42, '#1b2540'); g.addColorStop(1, '#0a0e18');
+  ctx.fillStyle = g; ctx.fillRect(-m, -m, T.W + 2 * m, T.H + 2 * m);
+}
+// フィールドを囲む枠の内側の面。上の面は光に背を向けるので暗く、下の面は光のほうを向くので明るい
+function frame3d(){
+  const b = 7;
+  ctx.fillStyle = '#232f4d'; ctx.fillRect(-40, 0, 40 + b, T.H); ctx.fillRect(T.W - b, 0, 40 + b, T.H);
+  ctx.fillStyle = '#04060b'; ctx.fillRect(-40, -40, T.W + 80, 40 + b);
+  ctx.fillStyle = '#42568a'; ctx.fillRect(-40, T.H - b, T.W + 80, 40 + b);
+}
+// 床に落ちる影。高さ h の物の上面は、光源から見て k = H/(H−h) 倍に広がった位置に映る。足元とその像の間が影になる。
+// 全部を1つの図形にまとめて1回で塗るので、影どうしが重なっても濃くならない（向きをそろえるのはそのため）。
+function castShadows(ps, pieces){
+  const Lg = T.LIGHT, P = (x, y, k) => [Lg.X + (x - Lg.X) * k, Lg.Y + (y - Lg.Y) * k], K = h => Lg.H / (Lg.H - h);
+  const poly = pts => { let a = 0; const n = pts.length; for (let i = 0; i < n; i++){ const p = pts[i], q = pts[(i + 1) % n]; a += p[0] * q[1] - q[0] * p[1]; } if (a < 0) pts = pts.slice().reverse(); ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < n; i++) ctx.lineTo(pts[i][0], pts[i][1]); ctx.closePath(); };
+  const disc = (x, y, r) => { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); };
+  const rect = (x, y, w, h, hh) => { const k = K(hh), a = [x, y], b = [x + w, y], c = [x + w, y + h], d = [x, y + h], A = P(x, y, k), B = P(x + w, y, k), Cc = P(x + w, y + h, k), D = P(x, y + h, k); poly([A, B, Cc, D]); poly([a, b, B, A]); poly([b, c, Cc, B]); poly([c, d, D, Cc]); poly([d, a, A, D]); };
+  const ball = (x, y, r, hh) => { const k = K(hh), c = P(x, y, k); disc(c[0], c[1], r * k); }; // 球は床から浮いているので、影は離れた円だけ（足元とはつながない）
+  const cap = (ax, ay, bx, by, r, hh) => { const k = K(hh), A = P(ax, ay, k), B = P(bx, by, k), rr = r * k; let nx = -(B[1] - A[1]), ny = B[0] - A[0]; const n = Math.hypot(nx, ny) || 1; nx /= n; ny /= n;
+    disc(A[0], A[1], rr); disc(B[0], B[1], rr); poly([[A[0] + nx * rr, A[1] + ny * rr], [B[0] + nx * rr, B[1] + ny * rr], [B[0] - nx * rr, B[1] - ny * rr], [A[0] - nx * rr, A[1] - ny * rr]]); poly([[ax, ay], [bx, by], B, A]); };
+  ctx.beginPath();
+  rect(-80, -40, T.W + 160, 40, Lg.FRAME_H); // 上の枠が内側に落とす影
+  for (const pr of ps){
+    if (pr.on === false || pr.c === 'laser' || pr.c === 'hidden' || pr.k === 'safe') continue; // 光そのもの（レーザー）と、見えない壁には影を付けない
+    if (pr.k === 'rect') rect(pr.x, pr.y, pr.w, pr.h, pr.c === 'wall' ? Lg.WALL_H : Lg.HAZ_H);
+    else if (pr.k === 'circ') ball(pr.x, pr.y, pr.r, Math.min(pr.r + 8, 40)); // 球は少し浮いている（大きい球は浮かせすぎない）
+    else if (pr.k === 'cap') cap(pr.ax, pr.ay, pr.bx, pr.by, pr.r, Lg.HAZ_H);
+    else if (pr.k === 'arc'){ const sec = TAU / pr.n, k = K(Lg.HAZ_H);
+      for (let i = 0; i < pr.n; i++){ const a1 = pr.a0 + i * sec + pr.gap, a2 = pr.a0 + (i + 1) * sec, st = Math.max(2, Math.ceil((a2 - a1) / 0.18)), pts = [];
+        for (let j = 0; j <= st; j++){ const a = a1 + (a2 - a1) * j / st; pts.push(P(pr.x + Math.cos(a) * (pr.R + pr.r), pr.y + Math.sin(a) * (pr.R + pr.r), k)); }
+        for (let j = st; j >= 0; j--){ const a = a1 + (a2 - a1) * j / st; pts.push(P(pr.x + Math.cos(a) * (pr.R - pr.r), pr.y + Math.sin(a) * (pr.R - pr.r), k)); }
+        poly(pts); } }
+  }
+  for (const p of pieces){
+    if (p.t === 'fakewall') rect(p.x, p.y, p.w, p.h, Lg.WALL_H); // 偽物も本物と同じ影を落とす
+    else if (p.t === 'shooter' || p.t === 'rotlaser' || p.t === 'beam' || p.t === 'danmaku' || p.t === 'bounce' || p.t === 'burst' || p.t === 'aimed') ball(p.x, p.y, 14, 20); // 砲台
+  }
+  ctx.save(); ctx.fillStyle = `rgba(2,4,10,${Lg.SHADOW})`; if (!THUMB && 'filter' in ctx) ctx.filter = 'blur(1.5px)'; ctx.fill(); ctx.restore(); // 縁を少しぼかす（縮小図では省く）
+}
+// 立体表示での1つの形の描き方（drawPieces から呼ぶ）
+function draw3d(pr){
+  if (pr.k === 'rect'){
+    if (pr.c === 'wall') block(pr.x, pr.y, pr.w, pr.h, '#2b3650', '#39486f');
+    else if ((pr.c === 'blink' || pr.c === 'warn') && !pr.on){ ctx.save(); ctx.globalAlpha = 0.3; ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.setLineDash([4, 6]); ctx.strokeRect(pr.x, pr.y, pr.w, pr.h); ctx.restore(); }
+    else block(pr.x, pr.y, pr.w, pr.h, '#c9264a', C.haz, C.haz);
+  } else if (pr.k === 'circ') sphere(pr.x, pr.y, pr.r);
+  else if (pr.k === 'arc'){ // 輪: 暗い地の上に、少し細い本体と、細い明るい筋
+    const sec = TAU / pr.n; ctx.save(); ctx.lineCap = 'butt';
+    for (const [w, col, a] of [[pr.r * 2, '#8a1832', 1], [pr.r * 1.4, C.haz, 1], [Math.max(2, pr.r * 0.3), '#ffd6dd', 0.6]]){ ctx.globalAlpha = a; ctx.strokeStyle = col; ctx.lineWidth = w; for (let i = 0; i < pr.n; i++){ ctx.beginPath(); ctx.arc(pr.x, pr.y, pr.R, pr.a0 + i * sec + pr.gap, pr.a0 + (i + 1) * sec); ctx.stroke(); } }
+    ctx.restore();
+  } else if (pr.k === 'cap'){
+    if (pr.c === 'laser'){ ctx.save(); ctx.lineCap = 'round'; // レーザーは光そのものなので陰影を付けない
+      if (pr.on !== false){ ctx.shadowColor = C.laser; ctx.shadowBlur = 16; ctx.strokeStyle = C.laser; ctx.lineWidth = pr.r * 2; } else { ctx.strokeStyle = C.laser; ctx.globalAlpha = 0.25; ctx.lineWidth = 2; ctx.setLineDash([4, 8]); }
+      ctx.beginPath(); ctx.moveTo(pr.ax, pr.ay); ctx.lineTo(pr.bx, pr.by); ctx.stroke(); ctx.restore(); }
+    else cylinder(pr.ax, pr.ay, pr.bx, pr.by, pr.r);
+    if (pr.src && (pr.src.t === 'bar' || pr.src.t === 'stretch')){ ctx.beginPath(); ctx.arc(pr.src.x, pr.src.y, pr.r + 4, 0, TAU); ctx.fillStyle = '#1a1f2c'; ctx.fill(); ctx.strokeStyle = C.haz; ctx.lineWidth = 2; ctx.stroke(); }
+  }
+}
 function drawPieces(pieces, ps, t){
   t = t || 0;
   ctx.save(); ctx.strokeStyle = C.haz; ctx.fillStyle = C.haz;
@@ -1733,12 +1839,19 @@ function drawPieces(pieces, ps, t){
     if (p.t === 'speedzone') zoneBox(p, C.cp, `≤ ${p.limit} px/s`);
     if (p.t === 'nostop'){ const s = stateOf(p), f = Math.min(1, (s.acc || 0) / p.grace); zoneBox(p, f > 0 ? C.haz : C.cp, `≥ ${p.min} px/s 止まるな`); }
   }
+  const depth = LOOK.depth;
+  if (depth && !LOOK.noShadow) castShadows(ps, pieces); // 影は床の上・物の下
+  if (depth) for (const p of pieces) if (p.t === 'fakewall'){ block(p.x, p.y, p.w, p.h, '#2b3650', '#39486f'); ctx.save(); ctx.strokeStyle = C['wall-edge']; ctx.lineWidth = 2; ctx.setLineDash([5, 3]); ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2); ctx.restore(); }
   // 小さい弾は数が多いので、まとめて1回で塗る（1個ずつ光らせると重い）
   let small = 0; ctx.beginPath();
   for (const pr of ps) if (pr.k === 'circ' && pr.r <= 9){ ctx.moveTo(pr.x + pr.r, pr.y); ctx.arc(pr.x, pr.y, pr.r, 0, TAU); small++; }
-  if (small){ ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 10; ctx.fillStyle = C.haz; ctx.fill(); ctx.restore(); }
+  if (small){ ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = depth ? 6 : 10; ctx.fillStyle = C.haz; ctx.fill(); ctx.restore(); }
+  if (small && depth){ // 光源側に小さな照り返しを付けて球に見せる（これもまとめて1回）
+    ctx.beginPath(); for (const pr of ps) if (pr.k === 'circ' && pr.r <= 9){ const [dx, dy] = lightDir(pr.x, pr.y), x = pr.x + dx * pr.r * 0.34, y = pr.y + dy * pr.r * 0.34, r = pr.r * 0.36; ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU); }
+    ctx.save(); ctx.fillStyle = '#ffd6dd'; ctx.globalAlpha = 0.85; ctx.fill(); ctx.restore(); }
   for (const pr of ps){
     if (pr.k === 'safe' || pr.c === 'hidden' || (pr.k === 'circ' && pr.r <= 9)) continue; // 浸水・透明壁は別に描く。小さい弾は上で描いた
+    if (depth){ draw3d(pr); continue; }
     if (pr.k === 'arc'){ // すき間のある輪: 区画ごとに、すき間を除いた弧を描く
       const sec = TAU / pr.n; ctx.save(); ctx.shadowColor = C.haz; ctx.shadowBlur = 14; ctx.strokeStyle = C.haz; ctx.lineWidth = pr.r * 2; ctx.lineCap = 'butt';
       for (let i = 0; i < pr.n; i++){ ctx.beginPath(); ctx.arc(pr.x, pr.y, pr.R, pr.a0 + i * sec + pr.gap, pr.a0 + (i + 1) * sec); ctx.stroke(); }
@@ -1900,7 +2013,7 @@ function drawMulti(now, ps, ht, level, layer){
         const bb = bounds(b.piece), sc = Math.min(0.32, (card.w - 30) / Math.max(1, bb.w), (card.h - 70) / Math.max(1, bb.h));
         ctx.save(); ctx.beginPath(); ctx.rect(card.x + 4, card.y + 36, card.w - 8, card.h - 62); ctx.clip(); // 長いレーザーがカードからはみ出さないように
         ctx.translate(card.x + card.w / 2, card.y + 42 + (card.h - 70) / 2); ctx.scale(sc, sc); ctx.translate(-(bb.x + bb.w / 2), -(bb.y + bb.h / 2));
-        if (taken) ctx.globalAlpha = 0.35; drawPieces([b.piece], prims({ pieces: [b.piece] }, ht), ht); ctx.restore();
+        if (taken) ctx.globalAlpha = 0.35; LOOK.noShadow = true; drawPieces([b.piece], prims({ pieces: [b.piece] }, ht), ht); LOOK.noShadow = false; ctx.restore(); // 見本は原点まわりの座標なので、影は付けない
         if (taken) text((pl.find(p => p.id === b.takenBy) || {}).name || '', card.x + card.w / 2, card.y + card.h - 14, 12, colorOf(b.takenBy), 'center', 500);
       });
     }
@@ -2183,12 +2296,14 @@ function draw(now, room, ps, ht, level, env){
   // 揺れる層: 格子と部屋
   const world = () => {
     const m = 40; // ずらしても端が欠けないよう、地と格子は部屋の少し外まで描く
-    ctx.fillStyle = C.arena; ctx.fillRect(-m, -m, T.W + 2 * m, T.H + 2 * m);
-    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
+    if (LOOK.depth) litFloor(m); else { ctx.fillStyle = C.arena; ctx.fillRect(-m, -m, T.W + 2 * m, T.H + 2 * m); }
+    ctx.save(); ctx.strokeStyle = LOOK.depth ? '#5f76a8' : C.grid; ctx.globalAlpha = LOOK.depth ? 0.14 : 1; ctx.lineWidth = 1; ctx.beginPath();
     for (let x = 0; x <= T.W; x += 80){ ctx.moveTo(x, -m); ctx.lineTo(x, T.H + m); }
     for (let y = 0; y <= T.H; y += 80){ ctx.moveTo(-m, y); ctx.lineTo(T.W + m, y); }
-    ctx.stroke();
+    ctx.stroke(); ctx.restore();
     if (state === 'watch') drawWatch(now, 'world'); else if (state === 'mp') drawMulti(now, ps, ht, level || [], 'world'); else if (!ui) drawSingle(now, room, ps, ht, 'world');
+    else if (LOOK.depth){ ctx.beginPath(); ctx.rect(-80, 0, T.W + 160, -T.LIGHT.Y * (T.LIGHT.H / (T.LIGHT.H - T.LIGHT.FRAME_H) - 1)); ctx.fillStyle = `rgba(2,4,10,${T.LIGHT.SHADOW})`; ctx.fill(); } // メニュー類でも上の枠の影だけは落とす
+    if (LOOK.depth) frame3d();
   };
   const sh = ui ? { x: 0, y: 0, amp: 0 } : shakeNow(room, ht, level || []);
   VIEW_C = ui ? null : sh.c;
@@ -2240,6 +2355,7 @@ H.line3.hidden = true; setMsg(); for (const c of COURSES) loadBest(c); // 旧形
   const v = LS.get('cursorrun.shake'), g = parseFloat(LS.get('cursorrun.shakeGain'));
   SHAKE.on = v ? v === '1' : !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   if (g >= 0.25 && g <= 2) SHAKE.gain = g;
+  LOOK.depth = LS.get('cursorrun.depth') !== '0'; // 立体表示は既定で ON（X で切替）
 }
 netInit(); ensureDaily(today());
 function loop(now){ try { update(now); } catch (e) { console.error(e); } requestAnimationFrame(loop); }
