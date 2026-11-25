@@ -25,20 +25,20 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:
 #msg .res{display:inline-grid;grid-template-columns:auto auto;gap:2px 18px;margin-top:10px;font-size:15px;text-align:left;font-variant-numeric:tabular-nums}
 #msg .medal{display:inline-block;margin-top:8px;padding:4px 14px;border-radius:999px;font-weight:700;letter-spacing:.1em}
 #msg .acts{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px}
-#msg .acts button{pointer-events:auto;font:inherit;font-size:14px;font-weight:700;color:var(--fg);background:var(--card);border:2px solid var(--wall-edge);border-radius:6px;padding:7px 14px;cursor:pointer}
+#msg .acts button{pointer-events:auto;font:inherit;font-size:14px;font-weight:700;color:var(--fg);background:var(--card);border:2px solid var(--wall-edge);border-radius:6px;padding:7px 14px;cursor:var(--cur-hot,pointer)}
 #msg .acts button:hover{border-color:var(--player);background:var(--card-hi)}
 #msg .acts button.go{border-color:var(--start);color:var(--start)}
 #msg .acts button:focus-visible{outline:2px solid var(--player);outline-offset:2px}
 #keys{position:fixed;right:max(14px,env(safe-area-inset-right,0px));top:max(10px,env(safe-area-inset-top,0px));color:var(--dim);font-size:12px;font-weight:500;text-align:right;pointer-events:none;line-height:1.5}
 [hidden]{display:none!important}
-/* 名前入力と共有テキストの小窓。ここだけは普通のカーソルで操作する */
-#overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(7,9,15,.72);z-index:5;padding-inline:max(16px,env(safe-area-inset-left,0px)) max(16px,env(safe-area-inset-right,0px))}
+/* 名前入力と共有テキストの小窓。カーソルはメニューと同じ矢印（--cur / --cur-hot は起動時に script が入れる）。入力欄の上だけ文字用 */
+#overlay{cursor:var(--cur,default);position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(7,9,15,.72);z-index:5;padding-inline:max(16px,env(safe-area-inset-left,0px)) max(16px,env(safe-area-inset-right,0px))}
 #overlay .box{background:var(--card);border:2px solid var(--wall-edge);border-radius:10px;padding:20px 22px;display:flex;flex-direction:column;gap:12px;width:min(440px,100%);box-sizing:border-box}
 #overlay label{font-weight:700;letter-spacing:.06em}
 #overlay input,#overlay textarea{font:inherit;font-size:18px;color:var(--fg);background:var(--bg);border:2px solid var(--wall-edge);border-radius:6px;padding:8px 10px;min-width:0}
 #overlay textarea{font-size:14px;font-weight:500;height:132px;resize:none;line-height:1.5}
 #overlay .row{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
-#overlay button{font:inherit;font-weight:700;color:var(--fg);background:var(--card-hi);border:2px solid var(--wall-edge);border-radius:6px;padding:8px 16px;cursor:pointer}
+#overlay button{font:inherit;font-weight:700;color:var(--fg);background:var(--card-hi);border:2px solid var(--wall-edge);border-radius:6px;padding:8px 16px;cursor:var(--cur-hot,pointer)}
 #overlay button.go{border-color:var(--start);color:var(--start)}
 #overlay :focus-visible{outline:2px solid var(--player);outline-offset:2px}
 #toast{position:fixed;left:50%;top:max(14px,env(safe-area-inset-top,0px));transform:translateX(-50%);background:var(--card);border:2px solid var(--start);border-radius:999px;padding:6px 18px;font-weight:700;font-size:14px;pointer-events:none;z-index:6;white-space:nowrap}
@@ -1205,7 +1205,7 @@ window.addEventListener('resize', resize); resize();
 const toL = e => ({ x: (e.clientX - view.ox) / view.s, y: (e.clientY - view.oy) / view.s });
 
 cvs.addEventListener('pointermove', e => { const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e]; if (!evs.length) evs.push(e); for (const ev of evs) samples.push(toL(ev)); });
-cvs.addEventListener('pointerdown', e => { const p = toL(e); samples.push(p); clicks.push(p); });
+cvs.addEventListener('pointerdown', e => { const p = toL(e); samples.push(p); clicks.push(p); UIC.clickT = performance.now(); UIC.cx = p.x; UIC.cy = p.y; });
 cvs.addEventListener('pointerup', e => { ups.push(toL(e)); });
 cvs.addEventListener('pointerleave', () => { samples.push({ x: -9999, y: -9999, out: true }); });
 window.addEventListener('contextmenu', e => e.preventDefault());
@@ -1282,7 +1282,7 @@ function drawLab(now){
   text('LAB', 20, 62, 46, C.fg); text('要素を1つずつ試す。記録は残らない', 150, 68, 16, C.dim, 'left', 500);
   text('DM 弾幕 · MV 移動物 · TR トラップ · FX 見え方 · SK 演出　　NEW = 図鑑に無かった新案', 20, 112, 13, C.dim, 'left', 500);
   for (const c of labCards()){
-    const hover = have && inRect(cur, c), col = LAB_COLORS[c.e.code.slice(0, 2)] || C.fg;
+    const hover = hov(c), col = LAB_COLORS[c.e.code.slice(0, 2)] || C.fg;
     ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2; ctx.beginPath(); ctx.roundRect(c.x, c.y, c.w, c.h, 10); ctx.fill(); ctx.stroke();
     text(c.e.code, c.x + 16, c.y + 26, 15, col); text(c.e.name, c.x + 84, c.y + 26, 19, C.fg);
     if (c.e.isNew) text('NEW', c.x + c.w - 16, c.y + 26, 12, C.start, 'right');
@@ -1403,9 +1403,9 @@ function hazardTime(now){
   if (state === 'count') return 0;
   return now / 1000; // タイトル中はプレビューで動かす
 }
-// メニュー・ランキング・リプレイ共通: カーソルを動かして尻尾を落とすだけ
+// メニュー・ランキング・リプレイ共通: カーソルを動かすだけ（矢印なので尻尾は落とさない）
 function uiCursor(now){
-  for (const s of samples){ if (s.out){ have = false; continue; } have = true; cur = s; dropDot(trail, cur.x, cur.y, now); }
+  for (const s of samples){ if (s.out){ have = false; continue; } have = true; cur = s; }
   samples.length = 0; pruneTrail(trail, now);
 }
 function update(now){
@@ -1431,7 +1431,7 @@ function update(now){
       if (h){ cur = s; die(h); continue; }
     }
     cur = s;
-    if (state !== 'dead') dropDot(trail, cur.x, cur.y, now);
+    if (state === 'count' || state === 'race') dropDot(trail, cur.x, cur.y, now); // 尻尾は自機のときだけ
     if (state === 'title'){ if (dist(cur, START) < T.PAD_R){ state = 'count'; countEnd = now + T.COUNTDOWN * 1000; setMsg(); } }
     else if (state === 'count'){ if (dist(cur, START) > T.PAD_R){ state = 'title'; falseStarts++; flyFlash = 1; setMsg(); } }
     else if (state === 'dead'){ if (dist(cur, cp) < T.PAD_R * 0.8) state = 'race'; }
@@ -1557,7 +1557,7 @@ function mpUpdate(now, dt){
     if (smp.out){ if (racing) mpDie(null); have = false; continue; }
     have = true;
     if (phase === 'run' && MP.status === 'running'){ const h = sweepHit(ps, cur.x, cur.y, smp.x, smp.y); if (h){ cur = smp; mpDie(h); continue; } }
-    cur = smp; if (MP.status !== 'dead') dropDot(trail, cur.x, cur.y, now);
+    cur = smp; if (racing) dropDot(trail, cur.x, cur.y, now); // 尻尾は自機のときだけ
   }
   samples.length = 0;
   speed = dt > 0 && hadCur && have ? dist(prevCur, cur) / dt : 0;
@@ -1632,6 +1632,69 @@ function head(x, y, color, alpha, hollow){
   else { ctx.fillStyle = color; ctx.fill(); ctx.shadowBlur = 0; ctx.beginPath(); ctx.arc(x, y, 3.5, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill(); }
   ctx.restore();
 }
+// ---- カーソルの見た目 ----
+// 自機（光る丸＋尻尾）を出すのは、当たり判定が入る場面だけ。それ以外は「指す道具」の矢印にして、
+// いま当たるのかどうかを形で見分けられるようにする。矢印の先・照準の中心・自機の中心は、どれも実際のポインター位置。
+//   game  自機: スタートパッドに乗ってから（カウントダウン・走行中・やられて復帰を待つ間）
+//   ui    矢印: メニュー・ランキング・ラボ・リプレイ・スタート前・結果、マルチのロビー／箱／結果
+//   place 照準: マルチで箱から出したピースを置く間
+const UIC = { hot: false, kind: 'ui', kindT: -1e9, clickT: -1e9, cx: 0, cy: 0 }; // hot: 押せるものの上にいる（描画のたびに立て直す）
+function cursorKind(){
+  if (state === 'mp'){
+    const s = MP.snap, ph = s ? s.phase : '';
+    if (ph === 'place') return MP.me && MP.me.pick !== null && !MP.me.placed ? 'place' : 'ui';
+    return ph === 'run' && (MP.status === 'running' || MP.status === 'dead') ? 'game' : 'ui';
+  }
+  return state === 'count' || state === 'race' || state === 'dead' ? 'game' : 'ui';
+}
+function hov(r){ const h = have && inRect(cur, r); if (h) UIC.hot = true; return h; } // 押せるものの当たり確認。乗っていれば矢印を「押せる」形にする
+// 矢印の形: 先端が原点、体は右下へ伸びる（左の辺がほぼ垂直になる傾き）。core は自機の白い芯にそろえた内側の小さな矢
+const CUR = (() => {
+  const a = 22.5 * DEG, c = Math.cos(a), s = Math.sin(a), rot = ([x, y]) => [x * c + y * s, -x * s + y * c];
+  const up = [[0, 0], [8.4, 21.5], [0, 16.4], [-8.4, 21.5]];
+  return { body: up.map(rot), core: up.map(([x, y]) => rot([x * 0.4, 4.4 + y * 0.4])), ink: '#05070c' };
+})();
+function curPath(pts){ ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); }
+// 矢印。大きさは画面の拡大率によらず一定（HTML のボタンに乗ったときの CSS カーソルと同じ大きさになる）
+function pointer(x, y, color, alpha, hot, k){
+  const z = (k || 1) / view.s;
+  ctx.save(); ctx.translate(x, y); ctx.scale(z, z); ctx.globalAlpha = alpha; ctx.lineJoin = 'round';
+  curPath(CUR.body); ctx.lineWidth = 5; ctx.strokeStyle = CUR.ink; ctx.stroke(); // 明るいカードの上でも沈まないよう、暗い縁取り
+  ctx.shadowColor = color; ctx.shadowBlur = hot ? 18 : 10; ctx.fillStyle = hot ? '#fff' : color; ctx.fill();
+  ctx.shadowBlur = 0; ctx.lineWidth = 1.5; ctx.strokeStyle = color; ctx.stroke();
+  curPath(CUR.core); ctx.fillStyle = hot ? color : '#fff'; ctx.fill();
+  ctx.restore();
+}
+// 設置の照準。中心がピースの置かれる点
+function reticle(x, y, color, alpha, k){
+  const z = (k || 1) / view.s, arms = () => { ctx.beginPath(); for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]){ ctx.moveTo(dx * 6.5, dy * 6.5); ctx.lineTo(dx * 15, dy * 15); } };
+  ctx.save(); ctx.translate(x, y); ctx.scale(z, z); ctx.globalAlpha = alpha; ctx.lineCap = 'round';
+  arms(); ctx.lineWidth = 6; ctx.strokeStyle = CUR.ink; ctx.stroke();
+  ctx.shadowColor = color; ctx.shadowBlur = 10; arms(); ctx.lineWidth = 2.6; ctx.strokeStyle = color; ctx.stroke(); ctx.shadowBlur = 0;
+  ctx.beginPath(); ctx.arc(0, 0, 3.4, 0, TAU); ctx.fillStyle = CUR.ink; ctx.fill(); ctx.beginPath(); ctx.arc(0, 0, 2, 0, TAU); ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.restore();
+}
+// 自分のカーソルを、いまの場面に合った形で描く。形が替わった瞬間は少し弾ませる（自機になるときは輪が広がる = 判定が入った合図）
+function drawCursor(now, color, dead){
+  const kind = cursorKind(); if (kind !== UIC.kind){ UIC.kind = kind; UIC.kindT = now; }
+  if (!have) return;
+  const u = Math.max(0, Math.min(1, (now - UIC.kindT) / 180)), pop = 1 + 0.4 * (1 - u) * (1 - u), z = 1 / view.s;
+  if (kind === 'game'){
+    head(cur.x, cur.y, dead ? C.ghost : color, 1, dead);
+    if (u < 1 && !dead){ ctx.save(); ctx.globalAlpha = 0.8 * (1 - u); ctx.beginPath(); ctx.arc(cur.x, cur.y, 9 + 24 * u, 0, TAU); ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke(); ctx.restore(); }
+    return;
+  }
+  const cu = (now - UIC.clickT) / 240; // 押した場所に小さな波紋
+  if (cu >= 0 && cu < 1){ ctx.save(); ctx.globalAlpha = 0.85 * (1 - cu) * (1 - cu); ctx.beginPath(); ctx.arc(UIC.cx, UIC.cy, (4 + 16 * cu) * z, 0, TAU); ctx.strokeStyle = color; ctx.lineWidth = 2.5 * z; ctx.stroke(); ctx.restore(); }
+  if (kind === 'place') reticle(cur.x, cur.y, color, 1, pop); else pointer(cur.x, cur.y, color, 1, UIC.hot, pop * (UIC.hot ? 1.12 : 1));
+}
+// HTML 側（結果のボタン・名前入力の小窓）に乗ったときも同じ矢印を出すための CSS カーソル。形は CUR から作る
+function cursorCss(hot){
+  const P = 7, pts = a => a.map(([x, y]) => (x + P).toFixed(1) + ',' + (y + P).toFixed(1)).join(' '), col = C.player || '#5ee1ff';
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="31" height="37" viewBox="0 0 31 37"><polygon points="${pts(CUR.body)}" fill="none" stroke="${CUR.ink}" stroke-width="5" stroke-linejoin="round"/><polygon points="${pts(CUR.body)}" fill="${hot ? '#fff' : col}" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/><polygon points="${pts(CUR.core)}" fill="${hot ? col : '#fff'}"/></svg>`;
+  return `url("data:image/svg+xml,${encodeURIComponent(svg)}") ${P} ${P}, ${hot ? 'pointer' : 'default'}`;
+}
+{ const rs = document.documentElement.style; if (rs && rs.setProperty){ rs.setProperty('--cur', cursorCss(false)); rs.setProperty('--cur-hot', cursorCss(true)); } }
 // 走行中のゴースト位置（時刻は前にしか進まないので添字を覚えておく）
 function ghostPose(g){
   if (!ghostOn || !(state === 'race' || state === 'dead')) return null;
@@ -1662,10 +1725,10 @@ function chip(r, label, hover){ ctx.fillStyle = hover ? C['card-hi'] : C.card; c
 function menuLabChip(){ return { x: 15, y: 582, w: 290, h: 40 }; }
 function drawMenu(now){
   text('CURSOR RUN', 15, 68, 46, C.fg);
-  const nc = menuNameChip(); chip(nc, '名前  ' + myName() + '  ✎', have && inRect(cur, nc));
-  const lc = menuLabChip(); chip(lc, `LAB 要素を試す（L）· ${LABS.length}個`, have && inRect(cur, lc));
+  const nc = menuNameChip(); chip(nc, '名前  ' + myName() + '  ✎', hov(nc));
+  const lc = menuLabChip(); chip(lc, `LAB 要素を試す（L）· ${LABS.length}個`, hov(lc));
   for (const card of menuCards()){
-    const hover = have && inRect(cur, card);
+    const hover = hov(card);
     ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = hover ? C.player : card.kind === 'daily' ? C.exit : C['wall-edge']; ctx.lineWidth = hover ? 3 : 2;
     ctx.beginPath(); ctx.roundRect(card.x, card.y, card.w, card.h, 10); ctx.fill(); ctx.stroke();
     if (card.kind === 'daily'){
@@ -1903,9 +1966,8 @@ function pieceAnchor(p){ return p.t === 'gate' ? { x: (p.ax + p.bx) / 2, y: (p.a
 // 当たり判定は揺れる前の座標で行うので、カーソルは実際のポインター位置から動かない。
 function drawSingle(now, room, ps, ht, layer){
   if (layer === 'over'){
-    drawTrail(trail, C.player, 0.9, now);
+    drawTrail(trail, C.player, 0.9, now); drawCursor(now, C.player, state === 'dead');
     if (have){
-      head(cur.x, cur.y, state === 'dead' ? C.ghost : C.player, 1, state === 'dead');
       if (debug){ ctx.beginPath(); ctx.arc(cur.x, cur.y, T.HEAD_R, 0, TAU); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
     }
     if (course.shakeLab){ // 振動ラボ: いまの設定と操作
@@ -1945,17 +2007,23 @@ function panel(x, y, w, h){ ctx.fillStyle = 'rgba(7,9,15,0.82)'; ctx.strokeStyle
 function drawMulti(now, ps, ht, level, layer){
   const s = MP.snap, phase = s ? s.phase : 'connecting', pl = s ? s.players : [], colorOf = id => (pl.find(p => p.id === id) || {}).color || C.ghost;
   const myColor = MP.me ? MP.me.color : C.player;
+  // 他プレイヤー。走っている間だけ自機の形、それ以外は小さな矢印。
+  // コースにいる間（スタート待ち・走行）は部屋と同じ層、箱・設置・結果の間はカードや表より手前に描く（誰がどれを狙っているか見える）
+  const field = phase === 'count' || phase === 'run';
+  const others = () => {
+    for (const p of pl){ if (p.id === MP.id) continue; const o = MP.others[p.id]; if (!o) continue;
+      const out = p.status === 'dead' || p.status === 'out', live = phase === 'run' && (p.status === 'running' || out);
+      if (live){ drawTrail(o.trail, p.color, 0.6, now); head(o.x, o.y, p.color, out ? 0.5 : 0.9, out); } else pointer(o.x, o.y, p.color, 0.85, false, 0.8);
+      text(p.name, o.x, o.y - 18, 12, p.color, 'center', 500);
+    }
+  };
   if (layer === 'world'){ // 部屋と他プレイヤー（揺れる層）
     if (s && phase !== 'lobby'){
       pad(MP_START.x, MP_START.y, T.PAD_R, C.start, phase === 'count' ? Math.ceil(Math.max(0, (s.deadline - serverNow()) / 1000)) + '' : 'START', phase === 'count' || phase === 'run');
       goal(MP_GOAL.x, MP_GOAL.y, T.PAD_R);
       drawPieces(level, ps, ht);
       for (const p of level) if (p.owner){ const a = pieceAnchor(p); ctx.beginPath(); ctx.arc(a.x, a.y, 5, 0, TAU); ctx.fillStyle = colorOf(p.owner); ctx.fill(); }
-      for (const p of pl){ if (p.id === MP.id) continue; const o = MP.others[p.id]; if (!o) continue;
-        const out = p.status === 'dead' || p.status === 'out';
-        drawTrail(o.trail, p.color, 0.6, now); head(o.x, o.y, p.color, out ? 0.5 : 0.9, out);
-        text(p.name, o.x, o.y - 18, 12, p.color, 'center', 500);
-      }
+      if (field) others();
     }
     return;
   }
@@ -1972,7 +2040,6 @@ function drawMulti(now, ps, ht, level, layer){
   }
   drawParticles();
   drawTrail(trail, myColor, 0.9, now);
-  if (have && phase !== 'connecting') head(cur.x, cur.y, MP.status === 'dead' ? C.ghost : myColor, 1, MP.status === 'dead');
   // バナー
   if (s){
     const left = Math.max(0, (s.deadline - serverNow()) / 1000);
@@ -1998,7 +2065,7 @@ function drawMulti(now, ps, ht, level, layer){
       text('毎ラウンド: 箱からピースを早い者勝ちで選ぶ → 全員同時に設置 → 全員同時に走る', T.W / 2, 235, 15, C.dim, 'center', 500);
       text('ゴール +2 · 1着 +1 · 単独ゴール +2 · 自分のピースで倒す +1 · 全員ゴールなら無得点', T.W / 2, 262, 15, C.dim, 'center', 500);
       pl.forEach((p, i) => { const y = 330 + i * 34; ctx.beginPath(); ctx.arc(T.W / 2 - 120, y, 8, 0, TAU); ctx.fillStyle = p.color; ctx.fill(); text(p.name, T.W / 2 - 100, y, 20, C.fg); text(p.ready ? 'READY' : '', T.W / 2 + 60, y, 16, C.start); });
-      const b = mpReadyBtn(), hover = have && inRect(cur, b), ready = MP.me && MP.me.ready;
+      const b = mpReadyBtn(), hover = hov(b), ready = MP.me && MP.me.ready;
       ctx.fillStyle = ready ? C.start : (hover ? C['card-hi'] : C.card); ctx.strokeStyle = C.start; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 10); ctx.fill(); ctx.stroke();
       text(ready ? 'READY ✓' : 'READY', b.x + b.w / 2, b.y + b.h / 2, 22, ready ? '#111' : C.fg, 'center');
       text('Enter でも可 · 全員 READY で開始', T.W / 2, 690, 13, C.dim, 'center', 500);
@@ -2006,6 +2073,7 @@ function drawMulti(now, ps, ht, level, layer){
     if (phase === 'box'){
       mpBoxCards().forEach((card, i) => {
         const b = s.box[i], taken = b.takenBy !== null, mine = b.takenBy === MP.id, hover = have && inRect(cur, card) && !taken;
+        if (hover && MP.me && MP.me.pick === null) UIC.hot = true; // まだ選んでいない間だけ「押せる」
         ctx.fillStyle = hover ? C['card-hi'] : C.card; ctx.strokeStyle = mine ? C.start : taken ? colorOf(b.takenBy) : hover ? C.player : C['wall-edge']; ctx.lineWidth = taken || hover ? 3 : 2;
         ctx.beginPath(); ctx.roundRect(card.x, card.y, card.w, card.h, 10); ctx.fill(); ctx.stroke();
         text(b.name, card.x + card.w / 2, card.y + 22, 15, taken ? C.dim : C.fg, 'center');
@@ -2030,6 +2098,8 @@ function drawMulti(now, ps, ht, level, layer){
     if (phase === 'final' && s.winner){ panel(T.W / 2 - 260, 240, 520, 160); text('WINNER', T.W / 2, 290, 28, C.dim, 'center'); text(s.winner.name, T.W / 2, 345, 48, s.winner.color, 'center'); }
   }
   if (MP.note && performance.now() < MP.noteT){ panel(T.W / 2 - 360, T.H - 90, 720, 44); text(MP.note, T.W / 2, T.H - 68, 15, C.fg, 'center', 500); }
+  if (s && phase !== 'lobby' && !field) others();
+  if (phase !== 'connecting') drawCursor(now, myColor, MP.status === 'dead'); // 表示類より手前。矢印がカードや表に隠れないように
 }
 
 // ===================== ランキング画面 =====================
@@ -2100,7 +2170,7 @@ function boardUpdate(now, dt){
   draw(now, null, [], 0);
 }
 function btn(b){
-  const hover = have && !b.off && inRect(cur, b);
+  const hover = !b.off && hov(b);
   ctx.globalAlpha = b.off ? 0.35 : 1; ctx.fillStyle = b.go && hover ? C.start : hover ? C['card-hi'] : C.card; ctx.strokeStyle = b.go ? C.start : hover ? C.player : C['wall-edge']; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 8); ctx.fill(); ctx.stroke();
   text(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1, b.h > 40 ? 20 : 14, b.go ? (hover ? '#111' : C.start) : C.fg, 'center'); ctx.globalAlpha = 1;
@@ -2109,7 +2179,7 @@ function drawBoard(now){
   const c = course, key = boardKey(c), rows = boardRows(c), rec = loadRec(key), shared = NET.mode !== 'local' && netRows(key), all = rows.filter(r => !r.bot), me = all.find(r => r.me);
   text(c.name, 40, 62, 44, c.daily ? C.exit : C.fg);
   text(c.daily ? `${c.daily.date} (${DOW[dayDow(c.daily.date)]}) · ${DAILY.TIER_NAME[c.daily.tier]} · ${c.rooms.length} ROOMS` : `${c.desc} · ${c.rooms.length} ROOMS`, 42, 104, 16, C.dim, 'left', 500);
-  const nc = boardNameChip(); chip(nc, '名前  ' + myName() + '  ✎', have && inRect(cur, nc));
+  const nc = boardNameChip(); chip(nc, '名前  ' + myName() + '  ✎', hov(nc));
   // 左: 自分の記録
   panel(40, 130, 430, 306);
   text('YOUR BEST', 62, 158, 13, C.dim);
@@ -2139,7 +2209,7 @@ function drawBoard(now){
   for (let i = BOARD.scroll; i < end; i++){
     const r = rows[i], ry = BL.y + (i - BOARD.scroll) * BL.rh, cy = ry + BL.rh / 2, hover = have && cur.x >= x && cur.x <= x + w && cur.y >= ry && cur.y < ry + BL.rh, col = rowColor(c, r), g = col && !r.me ? ghostFor(c, r) : undefined;
     if (r.me){ ctx.fillStyle = 'rgba(94,225,255,0.10)'; ctx.fillRect(x + 2, ry, w - 4, BL.rh); }
-    if (hover){ ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(x + 2, ry, w - 4, BL.rh); }
+    if (hover){ UIC.hot = true; ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(x + 2, ry, w - 4, BL.rh); }
     text(r.bot ? '–' : r.rank + '', x + 30, cy, 16, r.rank <= 3 ? C.exit : C.fg, 'center');
     ctx.beginPath(); ctx.arc(x + 62, cy, 7, 0, TAU); // 並走の印: 選択中は塗り、未選択は輪
     if (col){ ctx.fillStyle = col; ctx.globalAlpha = g === null ? 0.5 + 0.4 * Math.sin(now / 120) : 1; ctx.fill(); ctx.globalAlpha = 1; } else { ctx.strokeStyle = C.dim; ctx.lineWidth = 1.5; ctx.stroke(); }
@@ -2244,6 +2314,7 @@ function drawWatch(now, layer){
   W.list.forEach((g, i) => { if (i !== W.focus) drawReplayGhost(g, ms, ri, 0.55); }); drawReplayGhost(f, ms, ri, 1);
   // 走りの一覧（クリックか ↑↓ で追う相手を替える）
   const pn = watchPanel(); panel(pn.x, pn.y, pn.w, pn.h);
+  hov(pn); hov({ x: WL.x - 12, y: WL.y - 18, w: WL.w + 24, h: WL.h + 36 }); // 一覧とタイムラインは押せる
   W.list.forEach((g, i) => {
     const y = pn.y + 23 + i * 26; if (i === W.focus){ ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fillRect(pn.x + 2, y - 13, pn.w - 4, 26); }
     ctx.beginPath(); ctx.arc(pn.x + 18, y, 6, 0, TAU); ctx.fillStyle = g.color; ctx.fill();
@@ -2293,6 +2364,7 @@ function drawFx(f, c){
 function draw(now, room, ps, ht, level, env){
   const { s, ox, oy, dpr } = view, base = () => ctx.setTransform(dpr * s, 0, 0, dpr * s, ox * dpr, oy * dpr);
   const ui = state === 'menu' || state === 'board' || state === 'lab';
+  UIC.hot = false;
   // 揺れる層: 格子と部屋
   const world = () => {
     const m = 40; // ずらしても端が欠けないよう、地と格子は部屋の少し外まで描く
@@ -2335,9 +2407,7 @@ function draw(now, room, ps, ht, level, env){
   // 揺れない層: カーソルと表示類
   if (ui || state === 'watch'){
     if (state === 'menu') drawMenu(now); else if (state === 'board') drawBoard(now); else if (state === 'lab') drawLab(now); else drawWatch(now, 'over');
-    // リプレイ中は見ている人のカーソルを輪にする（再生中の自機と見分けるため）
-    if (state === 'watch'){ if (have){ ctx.beginPath(); ctx.arc(cur.x, cur.y, 7, 0, TAU); ctx.strokeStyle = C.fg; ctx.lineWidth = 2; ctx.stroke(); } }
-    else { drawTrail(trail, C.player, 0.9, now); if (have) head(cur.x, cur.y, C.player, 1, false); }
+    drawCursor(now, C.player, false); // どれも矢印（リプレイでは、再生中の自機と見ている人のカーソルが形で見分けられる）
   }
   else if (state === 'mp') drawMulti(now, ps, ht, level || [], 'over');
   else drawSingle(now, room, ps, ht, 'over');
