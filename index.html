@@ -1126,6 +1126,7 @@ function netRows(key){ // いま分かっている全員ぶんの行。まだ取
 function netSubmit(key, rec){ // → Promise<送れたか>
   if (NET.mode === 'api') return fetch('api/board/' + encodeURIComponent(key), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid: ME.pid, token: ME.token, name: myName(), t: rec.t, d: rec.d, g: rec.g }) })
     .then(r => r.json().then(j => { if (Array.isArray(j.rows)){ NET.boards.set(key, { rows: j.rows }); NET.ver++; } if (!j.ok && j.err) toast(j.err);
+      if (j.ok && j.held) toast('記録は確認待ちです。確かめが済むとランキングに載ります'); // サーバーが「障害物へのめり込みが多い」と見た走り。管理者が通すまで表に出ない
       if (!j.ok && (r.status === 429 || r.status >= 500)) return false; // 混んでいる・サーバーの不調: あとで送り直す
       return j.ok ? true : 'rejected'; })); // 中身を理由に断られた記録は送り直さない
   if (NET.mode === 'db' && NET.canWrite) return dbSubmit(key, rec);

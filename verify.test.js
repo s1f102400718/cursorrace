@@ -3,9 +3,10 @@
 //  2) 本物の走りは通る: 固定コースと 14 日ぶんのデイリーの BOT、速い人を模した走り（BOT の道を 2〜4 倍速）、ゲーム本体が実際に保存した記録
 //  3) 角を素早く回る走り（補間で壁の角を削る）を落とさない
 //  4) 偽物は落ちる: 中身のないゴースト／スタートしていない／部屋を飛ばす／ゴールしていない／瞬間移動／速すぎる／長い壁の通り抜け／死亡数のごまかし
-//  5) 重さ: 10分ぶんの走りと、わざと重くした記録でも 1 件あたりの時間が短い
+//     独立レビューが実際に通した手口: 出口に触れずに部屋だけ進める／上限の長さのゴーストに短いタイム／やられた1点で好きな場所へ飛ぶ／BOT よりはるかに速いタイム
+//  5) 重さ: 10分ぶんの走りと、わざと重くした記録でも 1 件あたりの時間が短い。道のりを測る回数を使い切らせる記録は落ちる
 const { load, botPath, runBot } = require('./harness.js');
-const { courseFor, dailyFor, verifyRun, V } = require('./verify.js');
+const { courseFor, dailyFor, verifyRun, parMs, V } = require('./verify.js');
 let fail = 0; const ok = (c, msg) => { if (!c){ fail++; console.log('  NG', msg); } return c; };
 const { m, clock } = load(['T', 'COURSES', 'boardKey', 'solveRoom', 'encodeGhost', 'decodeGhost', 'openBoard', 'play', 'update', 'samples', 'state', 'loadRec', 'deaths'], { wall: Date.now() });
 const enc = (s, ms) => m.encodeGhost(s, ms);
@@ -55,7 +56,22 @@ const scale = (bot, k) => bot.map((v, i) => i % 5 === 0 ? Math.round(v / k) : v)
   const noStart = b0.slice(); noStart[2] = 640; noStart[3] = 360; ok(/スタート/.test(why(enc(noStart, t0), t0)), 'スタートパッドの外から始めた走りが通った: ' + why(enc(noStart, t0), t0));
   const lastRoom = c0.rooms.length - 1, oneRoom = b0.filter((v, i) => b0[i - i % 5 + 1] === 0); ok(/ゴール/.test(why(enc(oneRoom, oneRoom[oneRoom.length - 5]), oneRoom[oneRoom.length - 5])), '最初の部屋だけの走りが通った');
   const skip = b0.map((v, i) => i % 5 === 1 && v >= 1 ? lastRoom : v); ok(why(enc(skip, t0), t0) !== 'ok', '部屋を飛ばした走りが通った'); // 圧縮は「1つ進んだ」しか書けないので、飛ばした走りはゴールに届かない
-  const tele = [0, 0, 90, 360, 1, 400, 0, 90, 360, 1, 433, 0, 1190, 300, 1, 900, 0, 1190, 360, 1]; ok(/瞬間移動|壁|ゴール/.test(why(enc(tele, 900), 900)), '瞬間移動が通った: ' + why(enc(tele, 900), 900));
+  const tele = [0, 0, 90, 360, 1, 400, 0, 90, 360, 1, 433, 0, 1190, 300, 1, 900, 0, 1190, 360, 1]; ok(why(enc(tele, 900), 900) !== 'ok', '瞬間移動が通った');
+  { const r = pathRun([[90, 360], [100, 360], [1150, 360], [1190, 360]], 300); r.s[5] = 3000; r.s[10] = 3033; r.s[15] = 3200; // 3 秒待ってから、1コマで部屋の端から端へ
+    const v = verifyRun({ start: { x: 90, y: 360 }, rooms: [{ exit: { x: 1190, y: 360 }, cps: [], pieces: [] }] }, enc(r.s, 3200), 3200, 0); ok(!v.ok && /瞬間移動/.test(v.why), '1コマで 1050px 動く走りが通った: ' + (v.ok ? 'ok' : v.why)); }
+  // ---- 独立レビューが通した手口 ----
+  // (a) スタートの近くから動かずに、部屋だけ次々に進める（出口は部屋の反対側）。タイムは十分に長くして、下限タイムではなく出口の確認で落ちることを見る
+  { const forged = [0, 0, 90, 360, 1]; for (let i = 1; i <= lastRoom; i++) forged.push(4000 + i * 2000, i, 150, 360, 1); forged.push(4000 + (lastRoom + 1) * 2000, lastRoom, c0.rooms[lastRoom].exit.x, c0.rooms[lastRoom].exit.y, 1);
+    const tt = forged[forged.length - 5], w = why(enc(forged, tt), tt); ok(/出口を通っていない/.test(w), '出口に触れずに部屋を進めた走りが通った: ' + w); }
+  // (b) 上限の長さ（10分ぶん）のゴーストをスタートパッドに置いたまま、タイムは 0.5 秒と申告
+  { const park = []; for (let i = 0; i < 18000; i++) park.push(Math.round(i * 1000 / 30), 0, 90, 360, 1); const g = enc(park, 18000 * 1000 / 30);
+    ok(why(g, 500) !== 'ok' && why(g, 60000) !== 'ok', '上限の長さのゴーストに短いタイムを付けた記録が通った'); }
+  // (c) やられた扱いの1点をはさんで、好きな場所へ飛ぶ
+  { const hop = [0, 0, 90, 360, 1, 1000, 0, 100, 360, 1, 1033, 0, 100, 360, 0, 1066, 0, c0.rooms[0].exit.x - 20, c0.rooms[0].exit.y, 0, 1100, 0, c0.rooms[0].exit.x - 20, c0.rooms[0].exit.y, 1, 1200, 0, c0.rooms[0].exit.x - 20, c0.rooms[0].exit.y, 1];
+    const v = verifyRun({ start: c0.start, rooms: [c0.rooms[0]] }, enc(hop, 1200), 1200, 1); ok(!v.ok && /復帰/.test(v.why), 'やられた1点で出口の前へ飛んだ走りが通った: ' + (v.ok ? 'ok' : v.why)); }
+  // (d) BOT のタイムの 1/6 より速い（道も部屋の順も正しい、速さだけがあり得ない）
+  { const B = bots[1], par = parMs(B.c), k = 7, tt = Math.round(B.t / k), v = verifyRun(B.c, enc(scale(B.bot, k), tt), tt, 0);
+    ok(Math.abs(par - B.t) < 50, 'サーバーが求めた BOT のタイムが違う: ' + par + ' / ' + B.t); ok(!v.ok && /BOT/.test(v.why), `${B.c.name} の ${k} 倍速（${tt}ms、BOT は ${B.t}ms）が通った: ` + (v.ok ? 'ok' : v.why)); }
   { const B = bots[1], k = 30, tt = Math.round(B.t / k), v = verifyRun(B.c, enc(scale(B.bot, k), tt), tt, 0); // BOT は 500px/s なので 30 倍 = 15000px/s
     ok(!v.ok, `${B.c.name} の ${k} 倍速（${tt}ms）が通った`); } // 理由は 速すぎる／瞬間移動／壁の通り抜け のどれか（先に見つかったもの）
   { const r = pathRun([[90, 360], [1190, 360], [90, 360], [1190, 360], [90, 360], [1190, 360]], 16000), v = verifyRun({ start: { x: 90, y: 360 }, rooms: [{ exit: { x: 1190, y: 360 }, cps: [], pieces: [] }] }, enc(r.s, r.t), r.t, 0);
@@ -80,8 +96,16 @@ const scale = (bot, k) => bot.map((v, i) => i % 5 === 0 ? Math.round(v / k) : v)
     // わざと重く: 壁をまたぐ短い往復を何千回もくり返す
     const zig = []; for (let i = 0; i < 6000; i++) zig.push(i * 33, 0, i === 0 ? 90 : i % 2 ? 590 : 650, 360, 1);
     const a2 = Date.now(), v2 = verifyRun(long, enc(zig, 6000 * 33), 6000 * 33, 0), ms2 = Date.now() - a2;
-    ok(!v2.ok, '壁をまたぐ往復が通った'); ok(ms2 < 1500, `わざと重くした記録の検証に ${ms2}ms`);
-    console.log(`   10分の走り ${ms}ms · わざと重くした記録 ${ms2}ms（上限 ${V.DETOUR_BUDGET} 回）`);
+    ok(!v2.ok, '壁をまたぐ往復が通った'); ok(ms2 < 400, `わざと重くした記録の検証に ${ms2}ms`);
+    // 道のりを測る回数を使い切らせる: 壁の先端のすぐ上を、短い往復で何百回もまたぐ（1回ごとは「角を削っただけ」に見える）
+    const tip = { start: { x: 90, y: 360 }, rooms: [{ exit: { x: 1190, y: 360 }, cps: [], pieces: [{ t: 'wall', x: 600, y: 0, w: 40, h: 400 }] }] }, nib = [0, 0, 90, 360, 1, 2000, 0, 590, 395, 1];
+    for (let i = 0; i < 600; i++) nib.push(2100 + i * 100, 0, i % 2 ? 590 : 650, 395, 1); nib.push(2100 + 600 * 100 + 2000, 0, 1190, 360, 1);
+    const tn = nib[nib.length - 5], a3 = Date.now(), v3 = verifyRun(tip, enc(nib, tn), tn, 0), ms3 = Date.now() - a3;
+    ok(!v3.ok && /多すぎる/.test(v3.why), '道のりを測る回数を使い切らせる記録が通った: ' + (v3.ok ? 'ok' : v3.why)); ok(ms3 < 400, `回数を使い切らせる記録の検証に ${ms3}ms`);
+    // 最大の大きさ（110KB）のでたらめなゴースト
+    const junk = Buffer.alloc(4 + 18000 * 3); junk[0] = 1; junk[1] = 30; junk[2] = 18000 & 255; junk[3] = 18000 >> 8; for (let i = 4; i < junk.length; i++) junk[i] = (i * 7919) & 255;
+    const a4 = Date.now(), v4 = verifyRun(c, junk.toString('base64'), 600000, 0), ms4 = Date.now() - a4; ok(!v4.ok && ms4 < 400, `でたらめな最大のゴースト: ${v4.ok ? '通った' : v4.why} ${ms4}ms`);
+    console.log(`   10分の走り ${ms}ms · 壁をまたぐ往復 ${ms2}ms · 回数を使い切らせる記録 ${ms3}ms（上限 ${V.DETOUR_BUDGET} 回）· でたらめな最大のゴースト ${ms4}ms`);
   }
 
   console.log(fail ? `VERIFY FAIL ${fail}` : 'VERIFY OK');

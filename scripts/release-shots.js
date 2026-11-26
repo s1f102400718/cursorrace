@@ -56,9 +56,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     return { state, deaths, finalTime };
   });
   check(run.state === 'done' && run.deaths === 0, 'BOT の走りで完走: ' + JSON.stringify(run));
-  await until(page, () => /rank/.test(document.getElementById('msg').textContent)).catch(() => {});
+  // 結果画面の順位は「サーバーの表＋手元の記録」で先に出るので、順位の表示ではなく「サーバーが受け取った印」が付くまで待つ
+  await until(page, () => /^api\|/.test((loadRec(boardKey(course)) || {}).sent || '')).catch(() => {});
   const rank = await page.evaluate(() => ({ msg: document.getElementById('msg').textContent, sent: (loadRec(boardKey(course)) || {}).sent, toast: document.getElementById('toast').textContent }));
-  check(/rank#1 \/ 1人/.test(rank.msg.replace(/\s/g, '').replace('rank', 'rank')) || /api\|/.test(rank.sent || ''), 'サーバーが走りを確かめて、ランキングに載った（' + (rank.sent || rank.toast) + '）');
+  check(/^api\|/.test(rank.sent || '') && /rank#1 \/ 1人/.test(rank.msg), 'サーバーが走りを確かめて、ランキングに載った（' + (rank.sent || rank.toast) + '）');
   const rows = await (await fetch(BASE + 'api/board/c-normal-v0_2')).json(); check(rows.rows.length === 1 && Math.abs(rows.rows[0].t - Math.round(run.finalTime * 1000)) <= 1, 'サーバーの表に 1 行: ' + JSON.stringify(rows.rows).slice(0, 100));
   await page.screenshot({ path: path.join(out, 'r-03-ranked.png') });
 

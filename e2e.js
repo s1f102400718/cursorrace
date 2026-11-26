@@ -16,12 +16,12 @@ function onState(c, s){
   if (c.name === 'A' && (!phases.length || phases[phases.length - 1] !== s.phase)) phases.push(s.phase);
   const me = s.players.find(p => p.id === c.id); if (!me) return;
   if (s.phase === 'lobby' && !me.ready && !c.readied && s.players.length >= 2){ c.readied = true; send(c, { t: 'ready' }); }
-  if (s.phase === 'box' && me.pick === null && !c.picked){ c.picked = true; const i = s.box.findIndex(b => b.takenBy === null); send(c, { t: 'pick', i }); }
+  if (s.phase === 'box' && me.pick === null && !c.picked){ c.picked = true; const free = s.box.map((b, k) => b.takenBy === null ? k : -1).filter(k => k >= 0); send(c, { t: 'pick', i: c.name === 'A' ? free[0] : free[free.length - 1] }); } // 2人が同じ箱を取り合わないよう、A は先頭・B は末尾から取る
   if (s.phase === 'place' && me.pick !== null && !me.placed && !c.placed){ c.placed = true;
     if (c.name === 'A') send(c, { t: 'place', x: 90, y: 360 }); // スタートパッドの上 → 拒否されるはず
-    setTimeout(() => send(c, { t: 'place', x: 640, y: 360, w: 200, h: 160 }), 50); }
+    setTimeout(() => send(c, { t: 'place', x: 640, y: 260, w: 200, h: 160 }), 50); } // どの型でも置ける場所（横断レーザーがパッドを貫かず、背の高い型も部屋に収まる）
   if (s.phase === 'run' && me.status === 'waiting' && !c.acted){ c.acted = true; send(c, { t: 'start' });
-    setTimeout(() => send(c, c.name === 'A' ? { t: 'finish' } : { t: 'dead', by: A.id }), 100); }
+    setTimeout(() => send(c, c.name === 'A' ? { t: 'finish' } : { t: 'dead', by: A.id }), 100); } // 倒した人として認められるのは、実際にピースを置いている人だけ（A は置いている）
   if (s.phase === 'results' && !c.seenResults){ c.seenResults = true; if (c.name === 'A') log.push('results: ' + JSON.stringify(s.results.rows.map(r => [r.name, r.status, r.pts, r.notes]))); }
 }
 let A, B;
