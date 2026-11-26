@@ -13,7 +13,7 @@ function load(names, opts = {}){
   const clock = { t: 0, wall: opts.wall || Date.UTC(2026, 10, 23, 3, 0, 0) };
   const env = {
     document: { getElementById: el, createElement: el, documentElement: {}, addEventListener(){}, hidden: false },
-    window: { innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1, addEventListener(){}, claude: opts.claude }, // claude: 公開アーティファクトの実行環境の代用品
+    window: { innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1, addEventListener(){}, claude: opts.claude, AudioContext: opts.AudioContext }, // claude: 公開アーティファクトの実行環境の代用品。AudioContext: 音の合成先の代用品（無ければ音は数えるだけ）
     getComputedStyle: () => ({ getPropertyValue: () => '#000' }),
     localStorage: { getItem: k => store.has(k) ? store.get(k) : null, setItem: (k, v) => { store.set(k, String(v)); }, removeItem: k => { store.delete(k); }, key: i => [...store.keys()][i], get length(){ return store.size; } },
     performance: { now: () => clock.t },

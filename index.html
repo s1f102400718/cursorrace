@@ -76,6 +76,8 @@ const T = {
   COUNTDOWN: 2.0,      // スタートパッド静止秒
   GHOST_HZ: 30,        // ゴースト記録レート
   POS_HZ: 20,          // マルチ: カーソル送信レート
+  GRAZE_R: 12,         // かすり: 動く障害物にここまで近づいて生き延びたら音と火花（見た目と音だけ。判定は変わらない）
+  GRAZE_GAP: 0.15,     // かすりを続けて数える最短の間隔(秒)
   // 画面の振動（見た目だけ。当たり判定にもカーソルの位置にも一切使わない）
   SHAKE: {
     MAX: 12,                                              // 合計の揺れ幅の上限(px)
@@ -1060,7 +1062,7 @@ function recGhost(key, rec){ const c = REC_GHOST.get(key); if (c && c.t === rec.
 function loadBest(c){ // 自己ベスト。v0.3 までの保存形式があれば引き継ぐ
   const key = boardKey(c); let rec = loadRec(key);
   if (!rec && !c.daily){ try { const old = JSON.parse(LS.get('cursorrun.best.' + c.id + '.' + COURSE_VER)); if (old && old.time > 0 && old.s && old.s.length){ rec = { t: Math.round(old.time * 1000), d: old.deaths | 0, ts: 0, g: encodeGhost(old.s, old.time * 1000), sent: '' }; saveRec(key, rec); } } catch (e) {} }
-  return rec ? { time: rec.t / 1000, deaths: rec.d, s: recGhost(key, rec) } : null;
+  return rec ? { time: rec.t / 1000, deaths: rec.d, s: recGhost(key, rec), sp: rec.sp } : null;
 }
 // デイリーを遊んだ日の記録（連続日数の表示用）
 let DLOG = null;
@@ -1205,7 +1207,7 @@ window.addEventListener('resize', resize); resize();
 const toL = e => ({ x: (e.clientX - view.ox) / view.s, y: (e.clientY - view.oy) / view.s });
 
 cvs.addEventListener('pointermove', e => { const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e]; if (!evs.length) evs.push(e); for (const ev of evs) samples.push(toL(ev)); });
-cvs.addEventListener('pointerdown', e => { const p = toL(e); samples.push(p); clicks.push(p); UIC.clickT = performance.now(); UIC.cx = p.x; UIC.cy = p.y; });
+cvs.addEventListener('pointerdown', e => { const p = toL(e); samples.push(p); clicks.push(p); UIC.clickT = performance.now(); UIC.cx = p.x; UIC.cy = p.y; sfxUnlock(); if (cursorKind() !== 'game') sfx('click'); });
 cvs.addEventListener('pointerup', e => { ups.push(toL(e)); });
 cvs.addEventListener('pointerleave', () => { samples.push({ x: -9999, y: -9999, out: true }); });
 window.addEventListener('contextmenu', e => e.preventDefault());
@@ -1213,7 +1215,8 @@ cvs.addEventListener('wheel', e => { if (state === 'board') BOARD.scroll += Math
 window.addEventListener('keydown', e => {
   if (OV.mode){ if (e.key === 'Escape') closeOv(); return; } // 名前入力中はゲームのキーを止める
   const k = e.key.toLowerCase();
-  if (shakeKey(k)) return;
+  sfxUnlock();
+  if (shakeKey(k) || soundKey(k)) return;
   if (state === 'mp'){
     if (k === 'm') mpLeave();
     if (k === 'enter') mpKeyReady();
@@ -1292,7 +1295,9 @@ function drawLab(now){
 function restart(){
   if (state === 'menu' || state === 'board' || state === 'lab' || state === 'watch' || state === 'mp') return;
   state = 'title'; roomIdx = 0; cp = START; cpsHit = new Set(); deaths = 0; splits = []; elapsed = 0; deathMark = null; roomDeaths = ROOMS.map(() => 0);
-  gRec = []; gLastT = -1; trail = []; particles = []; maxSpeed = 0; falseStarts = 0; history = []; resetPieceState(); raceGhosts = buildRaceGhosts(); setMsg();
+  gRec = []; gLastT = -1; trail = []; particles = []; maxSpeed = 0; falseStarts = 0; history = []; resetPieceState(); raceGhosts = buildRaceGhosts();
+  grazeT = -1; grazes = 0; splitPop = null; pbSplits = best ? splitsOf(best) : null; // 差を比べる相手は「走り始めたときの自己ベスト」
+  setMsg();
 }
 // 並走させるゴースト: 自己ベスト＋ランキングで選んだ相手（最大5）
 function buildRaceGhosts(){
@@ -1307,7 +1312,7 @@ function burst(color){
   trail = [];
 }
 function die(where){
-  deaths++; roomDeaths[roomIdx]++; state = 'dead'; deathMark = { x: cur.x, y: cur.y, t: elapsed }; burst('#5ee1ff');
+  deaths++; roomDeaths[roomIdx]++; state = 'dead'; deathMark = { x: cur.x, y: cur.y, t: elapsed }; burst('#5ee1ff'); sfx('die');
 }
 function enterRoom(i){
   roomIdx = i; cp = roomEntry(i); cpsHit = new Set(); trail = []; history = []; resetPieceState(); for (const g of raceGhosts) g.trail = [];
@@ -1318,10 +1323,11 @@ function finish(){
   const ms = Math.round(finalTime * 1000), key = boardKey(course), rec = loadRec(key);
   gRec.push(ms, roomIdx, Math.round(cur.x), Math.round(cur.y), 1); // ゴールの瞬間まで記録する
   lastRun = { name: myName(), s: gRec.slice(), t: ms, d: deaths };
-  if (course.lab){ doneBest = false; setMsg(false); return; } // ラボは記録もランキングもなし
+  if (course.lab){ doneBest = false; sfx('finish'); setMsg(false); return; } // ラボは記録もランキングもなし
   doneBest = !rec || ms < rec.t;
+  sfx(doneBest ? 'best' : 'finish'); popSplit(roomIdx, performance.now());
   if (doneBest){
-    saveRec(key, { t: ms, d: deaths, ts: nowMs(), g: encodeGhost(gRec, ms), rd: roomDeaths.slice(), sent: '' });
+    saveRec(key, { t: ms, d: deaths, ts: nowMs(), g: encodeGhost(gRec, ms), rd: roomDeaths.slice(), sp: splits.map(v => Math.round(v * 1000)), sent: '' });
     best = loadBest(course);
     if (course.daily && canRank(course)) logDaily(course.daily.date, ms, deaths);
   }
@@ -1332,10 +1338,10 @@ function fmt(t){ return t.toFixed(2); }
 function esc(s){ return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])); }
 const MEDAL_COLORS = { GOLD: '#ffd044', SILVER: '#cfd8e6', BRONZE: '#d08a4c' };
 const KEYS = {
-  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前 · L ラボ',
+  menu: 'Enter デイリー · 1–3 コース · 4 オンライン · N 名前 · L ラボ · S 音 · , . 音量',
   lab: 'カードをクリックして試す · M メニュー',
   board: 'Enter スタート · W リプレイ · C 結果をコピー · N 名前 · M メニュー',
-  run: 'R リスタート · B ランキング · G ゴースト · V 振動 · X 立体 · M メニュー',
+  run: 'R リスタート · B ランキング · G ゴースト · V 振動 · X 立体 · S 音 · M メニュー',
   watch: 'Space 一時停止 · ←→ 1秒(Shiftで5秒) · ↑↓ 切替 · 1/2/3 速度 · B 戻る',
 };
 function setMsg(isBest){
@@ -1347,19 +1353,22 @@ function setMsg(isBest){
   else if (state === 'title' && course.lab) H.msg.innerHTML = `<h1>${esc(course.name)}</h1><p>${esc(course.desc)}。緑のパッドに置くとスタート。</p><p>記録は残らない。B でラボの一覧に戻る。</p>`;
   else if (state === 'title') H.msg.innerHTML = `<h1>${esc(course.name)}</h1><p>緑のパッドにカーソルを置くとカウントダウン。壁と赤いものに触れたら直前のパッドへ戻る。部屋の外に出ても死ぬ。</p><p>GOLD ${course.medals[0]}s · SILVER ${course.medals[1]}s · BRONZE ${course.medals[2]}s</p>`;
   else if (state === 'done'){
-    const rows = splits.map((s, i) => `<span>${esc(ROOMS[i].name)}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}</span>`).join('');
+    const vs = pbSplits && pbSplits.length === splits.length ? pbSplits : null; // 走り始めたときの自己ベストとの差（速ければ緑、遅ければ赤）
+    const dl = i => { if (!vs) return ''; const d = splits[i] - vs[i]; return ` <b style="color:${d < 0 ? C.start : C.haz}">${d < 0 ? '−' : '+'}${fmt(Math.abs(d))}</b>`; };
+    const rows = splits.map((s, i) => `<span>${esc(ROOMS[i].name)}</span><span>${fmt(s)}${i ? ' (+' + fmt(s - splits[i - 1]) + ')' : ''}${dl(i)}</span>`).join('');
     const m = medalFor(course, finalTime);
     const medal = m ? `<div><span class="medal" style="background:${MEDAL_COLORS[m]};color:#111">${m}</span></div>` : '';
     // 順位は共有ランキングが読めているときだけ出す（自己ベストの順位）
     const key = boardKey(course), all = boardRows(course).filter(r => !r.bot), me = all.find(r => r.me);
     const rank = NET.mode !== 'local' && canRank(course) && netRows(key) && me ? `<span>rank</span><span>#${me.rank} / ${all.length}人</span>` : '';
     const note = course.daily && !canRank(course) ? '<p>過去のデイリーは練習扱い（ランキングには載りません）</p>' : '';
-    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span>${rank}</div>${note}<div class="acts"><button type="button" class="go" data-act="retry">R リスタート</button><button type="button" data-act="watch">W 今の走りを見る</button>${course.lab ? '' : '<button type="button" data-act="share">C 結果をコピー</button>'}<button type="button" data-act="board">${course.lab ? 'B ラボに戻る' : 'B ランキング'}</button></div>`;
+    H.msg.innerHTML = `<h1>${isBest ? 'NEW BEST ' : 'FINISH '}${fmt(finalTime)}</h1>${medal}<div class="res">${rows}<span>deaths</span><span>${deaths}</span><span>graze</span><span>${grazes}</span>${rank}</div>${note}<div class="acts"><button type="button" class="go" data-act="retry">R リスタート</button><button type="button" data-act="watch">W 今の走りを見る</button>${course.lab ? '' : '<button type="button" data-act="share">C 結果をコピー</button>'}<button type="button" data-act="board">${course.lab ? 'B ラボに戻る' : 'B ランキング'}</button></div>`;
   } else H.msg.innerHTML = '';
 }
 // 結果画面のボタン（キーでも同じことができる）
 H.msg.addEventListener('click', e => {
   const a = e.target && e.target.dataset ? e.target.dataset.act : null; if (!a || state !== 'done') return;
+  sfxUnlock(); sfx('click');
   if (a === 'retry') restart(); else if (a === 'watch') watchLast(); else if (a === 'share') doShare(); else if (a === 'board') openBoard(course);
 });
 
@@ -1396,8 +1405,154 @@ function doShare(){
   try { if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(() => toast('結果をコピーしました'), fail); else fail(); } catch (e) { fail(); }
 }
 
+// ===================== 音（素材なし。WebAudio でその場で合成する） =====================
+// 音は見た目と同じ扱いで、当たり判定・記録・コースの生成には一切関わらない。鳴らす合図はすべて sfx(名前) を通る。
+// 障害物の音は cueOf（時刻で決まる状態）が変わった瞬間に鳴らす。予告は目を離していても耳で分かる。
+// S = 入/切、, . = 音量。端末に覚えておく。ブラウザは操作があるまで音を出せないので、最初のクリックかキーで用意する。
+const SFX = { on: LS.get('cursorrun.sound') !== '0', vol: 0.7, ac: null, out: null, hz: null, nbuf: null, wind: null, last: {}, count: {}, trace: null };
+{ const v = parseFloat(LS.get('cursorrun.vol')); if (v >= 0 && v <= 1) SFX.vol = v; }
+function sfxUnlock(){
+  if (!SFX.on) return;
+  if (!SFX.ac){
+    const AC = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext); if (!AC) return;
+    try {
+      const ac = new AC(), out = ac.createGain(), comp = ac.createDynamicsCompressor(); // 重なっても割れないよう、最後に圧縮を通す
+      out.gain.value = SFX.vol; out.connect(comp); comp.connect(ac.destination);
+      const len = ac.sampleRate, buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1; // 雑音1秒ぶん（爆発・風・レーザーの材料）
+      SFX.ac = ac; SFX.out = out; SFX.nbuf = buf; SFX.hz = sfxBus();
+    } catch (e) { SFX.ac = null; return; }
+  }
+  if (SFX.ac.state === 'suspended' && SFX.ac.resume){ try { SFX.ac.resume(); } catch (e) {} }
+}
+function sfxBus(){ const g = SFX.ac.createGain(); g.connect(SFX.out); return g; }
+function sfxApply(){ if (SFX.out) SFX.out.gain.value = SFX.on ? SFX.vol : 0; }
+function sfxHush(){ // 障害物の音をすぐ止める（部屋を出た・やり直した）。長い照射音が次の場面に残らないように、行き先ごと取り替える
+  if (!SFX.ac || !SFX.hz) return;
+  SFX.hz.gain.setTargetAtTime(0, SFX.ac.currentTime, 0.03); SFX.hz = sfxBus();
+}
+function sfxEnv(g, t0, dur, peak, a, hold){ // 音量の山。hold = 終わり際まで保つ（照射音）
+  const A = a || 0.004, p = Math.max(0.0002, peak);
+  g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(p, t0 + A);
+  if (hold) g.gain.setValueAtTime(p, t0 + Math.max(A, dur - 0.07));
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + Math.max(A + 0.01, dur));
+}
+function sfxOut(node, o){ // 左右に振って行き先へ
+  const ac = SFX.ac, dest = o.bus || SFX.out;
+  if (o.pan && ac.createStereoPanner){ const p = ac.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, o.pan)); node.connect(p); p.connect(dest); } else node.connect(dest);
+}
+function tone(o){ // 音程のある音 { f, f1(終わりの高さ), type, at(何秒後), dur, g, a, hold, pan, bus }
+  const ac = SFX.ac, t0 = ac.currentTime + (o.at || 0), vco = ac.createOscillator(), g = ac.createGain();
+  vco.type = o.type || 'sine'; vco.frequency.setValueAtTime(o.f, t0); if (o.f1) vco.frequency.exponentialRampToValueAtTime(o.f1, t0 + o.dur);
+  sfxEnv(g, t0, o.dur, o.g, o.a, o.hold); vco.connect(g); sfxOut(g, o); vco.start(t0); vco.stop(t0 + o.dur + 0.03);
+}
+function hiss(o){ // 雑音にフィルターをかけた音 { f, f1, q, kind, at, dur, g, a, pan, bus }
+  const ac = SFX.ac, t0 = ac.currentTime + (o.at || 0), src = ac.createBufferSource(), fl = ac.createBiquadFilter(), g = ac.createGain();
+  src.buffer = SFX.nbuf; src.loop = true; fl.type = o.kind || 'bandpass'; fl.Q.value = o.q || 1; fl.frequency.setValueAtTime(o.f, t0); if (o.f1) fl.frequency.exponentialRampToValueAtTime(o.f1, t0 + o.dur);
+  sfxEnv(g, t0, o.dur, o.g, o.a); src.connect(fl); fl.connect(g); sfxOut(g, o); src.start(t0, Math.random() * 0.9); src.stop(t0 + o.dur + 0.03);
+}
+// 合図ごとの音。o = { g 近さによる音量, pan 左右, n 何番目の部屋か, dur 照射の長さ, bus すぐ止められる行き先 }
+const CUES = {
+  click:  o => tone({ f: 740, f1: 990, type: 'triangle', dur: 0.045, g: 0.22 }),
+  tick:   o => tone({ f: 523, type: 'triangle', dur: 0.09, g: 0.3 }),
+  go:     o => { tone({ f: 1047, type: 'triangle', dur: 0.28, g: 0.32 }); tone({ f: 1568, type: 'sine', dur: 0.32, g: 0.2 }); },
+  fault:  o => { tone({ f: 150, f1: 95, type: 'sawtooth', dur: 0.22, g: 0.3 }); tone({ f: 157, f1: 99, type: 'square', dur: 0.22, g: 0.12 }); },
+  die:    o => { hiss({ f: 2600, f1: 160, kind: 'lowpass', dur: 0.38, g: 0.6 }); tone({ f: 260, f1: 52, type: 'sawtooth', dur: 0.36, g: 0.34 }); },
+  revive: o => { tone({ f: 392, f1: 587, type: 'triangle', dur: 0.09, g: 0.26 }); tone({ f: 784, type: 'triangle', at: 0.08, dur: 0.14, g: 0.24 }); },
+  cp:     o => { tone({ f: 880, type: 'sine', dur: 0.1, g: 0.26 }); tone({ f: 1319, type: 'sine', at: 0.07, dur: 0.2, g: 0.24 }); },
+  room:   o => { const k = 2 ** (Math.min(6, o.n || 0) / 6); tone({ f: 523 * k, type: 'triangle', dur: 0.1, g: 0.28 }); tone({ f: 784 * k, type: 'triangle', at: 0.08, dur: 0.22, g: 0.28 }); }, // 部屋が進むほど高い
+  ahead:  o => { tone({ f: 1568, type: 'sine', at: 0.2, dur: 0.12, g: 0.2 }); tone({ f: 2093, type: 'sine', at: 0.28, dur: 0.25, g: 0.2 }); }, // 自己ベストより速い
+  behind: o => tone({ f: 330, f1: 262, type: 'triangle', at: 0.2, dur: 0.25, g: 0.2 }),                                                         // 遅い
+  finish: o => [523, 659, 784, 1047].forEach((f, i) => tone({ f, type: 'triangle', at: i * 0.08, dur: i === 3 ? 0.5 : 0.14, g: 0.28 })),
+  best:   o => { [523, 659, 784, 1047, 1319, 1568].forEach((f, i) => tone({ f, type: 'triangle', at: i * 0.07, dur: i === 5 ? 0.7 : 0.14, g: 0.28 })); hiss({ f: 6000, kind: 'highpass', at: 0.4, dur: 0.6, g: 0.08 }); },
+  graze:  o => { tone({ f: 1900, f1: 2700, type: 'sine', dur: 0.05, g: 0.12 }); hiss({ f: 5200, kind: 'highpass', dur: 0.04, g: 0.07 }); },
+  // ---- 障害物 ----
+  warn:   o => { for (let i = 0; i < 2; i++) tone({ f: 988, type: 'square', at: i * 0.11, dur: 0.06, g: 0.2 * o.g, pan: o.pan, bus: o.bus }); },
+  laser:  o => { const d = Math.max(0.1, Math.min(2.5, o.dur || 0.6)); tone({ f: 98, type: 'sawtooth', dur: d, g: 0.2 * o.g, hold: true, pan: o.pan, bus: o.bus }); tone({ f: 1480, f1: 1320, type: 'square', dur: d, g: 0.035 * o.g, hold: true, pan: o.pan, bus: o.bus }); hiss({ f: 2400, f1: 900, q: 0.8, dur: 0.16, g: 0.3 * o.g, pan: o.pan, bus: o.bus }); },
+  zap:    o => { hiss({ f: 3200, q: 2, dur: 0.07, g: 0.14 * o.g, pan: o.pan, bus: o.bus }); tone({ f: 1250, f1: 620, type: 'square', dur: 0.06, g: 0.06 * o.g, pan: o.pan, bus: o.bus }); },
+  shot:   o => tone({ f: 560, f1: 250, type: 'square', dur: 0.07, g: 0.07 * o.g, pan: o.pan, bus: o.bus }),
+  slam:   o => { hiss({ f: 500, f1: 120, kind: 'lowpass', dur: 0.2, g: 0.5 * o.g, pan: o.pan, bus: o.bus }); tone({ f: 95, f1: 44, type: 'sine', dur: 0.22, g: 0.4 * o.g, pan: o.pan, bus: o.bus }); },
+  arm:    o => { for (let i = 0; i < 3; i++) tone({ f: 1568, type: 'square', at: i * 0.09, dur: 0.045, g: 0.12 * o.g, pan: o.pan, bus: o.bus }); },
+  boom:   o => { hiss({ f: 1400, f1: 70, kind: 'lowpass', dur: 0.55, g: 0.8 * o.g, pan: o.pan, bus: o.bus }); tone({ f: 82, f1: 34, type: 'sine', dur: 0.5, g: 0.5 * o.g, pan: o.pan, bus: o.bus }); },
+  alarm:  o => { for (let i = 0; i < 4; i++) tone({ f: i % 2 ? 440 : 587, type: 'sawtooth', at: i * 0.13, dur: 0.11, g: 0.3 * o.g, bus: o.bus }); },
+  flood:  o => { hiss({ f: 400, f1: 1800, kind: 'lowpass', dur: 0.6, g: 1.6 * o.g, bus: o.bus }); tone({ f: 60, f1: 110, type: 'sine', dur: 0.5, g: 0.35 * o.g, bus: o.bus }); },
+};
+const SFX_GAP = { shot: 45, zap: 50, warn: 70, slam: 60, graze: 100, click: 30 }; // 同じ音を続けて鳴らせる最短の間隔(ms)。弾幕などで重なって割れるのを防ぐ
+function sfx(name, o){
+  if (!SFX.on) return;
+  const now = performance.now(), gap = SFX_GAP[name] || 0; if (gap && Math.abs(now - (SFX.last[name] || -1e9)) < gap) return; SFX.last[name] = now;
+  SFX.count[name] = (SFX.count[name] || 0) + 1; if (SFX.trace) SFX.trace.push(name); // 数と並びは音が出せない環境でも残す（テスト用）
+  if (!SFX.ac || SFX.ac.state !== 'running') return; // 止まっている間に予約すると、再開したときにまとめて鳴ってしまう
+  try { CUES[name](o || { g: 1 }); } catch (e) { SFX.err = e; } // 音が作れなくてもゲームは止めない
+}
+function sfxWind(v, on){ // カーソルの速さに合わせた風切り音。v = px/s。走っている間だけ
+  const ac = SFX.ac; if (!ac || ac.state !== 'running') return;
+  if (!SFX.wind){ if (!on) return; const src = ac.createBufferSource(), fl = ac.createBiquadFilter(), g = ac.createGain(); src.buffer = SFX.nbuf; src.loop = true; fl.type = 'bandpass'; fl.Q.value = 0.7; fl.frequency.value = 600; g.gain.value = 0; src.connect(fl); fl.connect(g); g.connect(SFX.out); src.start(); SFX.wind = { fl, g, k: 0 }; }
+  const k = on ? Math.min(1, v / 3200) : 0; if (k === 0 && SFX.wind.k === 0) return; SFX.wind.k = k;
+  SFX.wind.g.gain.setTargetAtTime(0.11 * k * k, ac.currentTime, 0.06); SFX.wind.fl.frequency.setTargetAtTime(500 + 2600 * k, ac.currentTime, 0.06);
+}
+function soundKey(k){ // 音の設定キー（どの画面でも効く）
+  if (k === 's'){ SFX.on = !SFX.on; LS.set('cursorrun.sound', SFX.on ? '1' : '0'); sfxUnlock(); sfxApply(); toast('音 ' + (SFX.on ? 'ON' : 'OFF')); sfx('click'); return true; }
+  if (k === ',' || k === '.'){ SFX.vol = Math.max(0, Math.min(1, Math.round((SFX.vol + (k === '.' ? 0.1 : -0.1)) * 10) / 10)); LS.set('cursorrun.vol', SFX.vol); sfxApply(); toast('音量 ' + Math.round(SFX.vol * 100) + '%'); sfx('tick'); return true; }
+  return false;
+}
+// 障害物の「合図の状態」。時刻（地雷だけは踏んだかどうか）で決まる文字列で、変わった瞬間に音を鳴らす。
+// 頭の1文字が種類: w 予告 / f 照射・作動 / s 発射 / c 叩きつけ / a 起動。'' は静か、null は音のない型
+function cueOf(p, t){
+  switch (p.t){
+    case 'beam': case 'rotlaser': { const cyc = p.on + p.warn + p.off, ph = frac(t / cyc + (p.phase || 0)) * cyc; return ph < p.warn ? 'w' : ph < p.warn + p.on ? 'f' : ''; }
+    case 'gate': case 'blink': return frac(t / p.period + (p.phase || 0)) < p.duty ? 'f' : '';
+    case 'warnfloor': { const ph = frac(t / p.period + (p.phase || 0)); return ph < p.duty ? 'f' : ph > 1 - p.warn / p.period ? 'w' : ''; }
+    case 'seq': { const st = seqState(p, t); return st.on ? 'f' + st.act : ''; }
+    case 'flood': { const st = floodState(p, t); return st.on ? 'f' : st.warn ? 'w' : ''; }
+    case 'mine': { const s = PSTATE.get(p.id || p), ph = s && s.ph; return ph === 'armed' ? 'a' : ph === 'blast' ? 'f' : ''; }
+    case 'crusher': return 'c' + Math.floor(t / p.period + (p.phase || 0) - 0.5); // 顎が閉じきった瞬間に数字が進む
+    case 'shooter': return 's' + Math.floor(t / p.interval + (p.phase || 0));
+    case 'aimed': case 'bounce': case 'burst': return 's' + Math.floor(t / p.interval);
+    case 'danmaku': return 's' + Math.floor(t / p.interval - (p.phase || 0));
+  }
+  return null;
+}
+const CUE_FIRE = { beam: 'laser', rotlaser: 'laser', mine: 'boom', flood: 'flood' }; // 作動したときの音（書いていない型は zap）
+function cueSound(p, v){ const k = v[0]; return k === 'w' ? (p.t === 'flood' ? 'alarm' : 'warn') : k === 'f' ? CUE_FIRE[p.t] || 'zap' : k === 's' ? 'shot' : k === 'c' ? 'slam' : k === 'a' ? 'arm' : null; }
+const CUE = { key: null, st: new Map() };
+// key = いま障害物の音を鳴らす場面（null = 鳴らさない）。場面が替わったら鳴りかけの音を止めて、状態を覚え直す。
+// c = 聞いている位置（カーソル）。近い障害物ほど大きく、左右の位置で振る。部屋全体に効くもの（横断レーザー・浸水）は距離で弱めない
+function hazardCues(key, pieces, t, c){
+  if (key !== CUE.key){ CUE.key = key; CUE.st.clear(); sfxHush(); }
+  if (key === null) return;
+  for (const p of pieces){
+    const v = cueOf(p, t); if (v === null) continue;
+    const id = p.id || p, prev = CUE.st.get(id); CUE.st.set(id, v);
+    if (prev === undefined || prev === v || !v) continue; // 初めて見たフレームは覚えるだけ
+    const name = cueSound(p, v); if (!name) continue;
+    let g = 1, pan = 0;
+    if (p.t !== 'flood'){ const a = pieceAnchor(p); pan = Math.max(-0.7, Math.min(0.7, (a.x - T.W / 2) / (T.W / 2))); if (p.t !== 'beam' && c) g = Math.max(0.3, Math.min(1, 1.2 - dist(a, c) / 800)); }
+    sfx(name, { g, pan, dur: p.on, bus: SFX.hz });
+  }
+}
+// かすり: 動く障害物（壁以外）のすぐそばにいるか
+function grazeHit(ps, c){
+  const r = T.HEAD_R + T.GRAZE_R;
+  for (const pr of ps){ if (pr.c === 'wall' || pr.c === 'hidden' || pr.k === 'safe') continue; if (hit(pr, c.x, c.y, c.x, c.y, r)) return pr; }
+  return null;
+}
+// 区間タイム（秒）。記録に入っていればそれを使う。古い記録（区間タイムなし）はゴーストの部屋の切り替わりから求める。
+// ゴーストは 30Hz で「切り替わった後の最初の1点」しか分からないので、途中の区間は記録間隔の半分だけ早めて偏りを消す（誤差は ±0.02 秒ほど）。最後の区間は記録のタイムそのもの
+function splitsOf(b){
+  if (b.sp && b.sp.length) return b.sp.map(v => v / 1000);
+  if (!b.s || b.s.length < 10) return null;
+  return [...ghostMarks(b.s).rooms.map(v => Math.max(0, v / 1000 - 0.5 / T.GHOST_HZ)), b.time];
+}
+
 // ===================== 更新（シングル） =====================
 let lastNow = performance.now();
+let countN = -1, grazeT = -1, grazes = 0, pbSplits = null, splitPop = null; // カウントダウンの数字 / かすり / 自己ベストの区間タイム / 部屋を抜けた瞬間に出す差
+function popSplit(i, now){ // i 番目の部屋を抜けた。自己ベストとの差を出す
+  if (!pbSplits || pbSplits[i] === undefined || pbSplits.length !== ROOMS.length) return;
+  splitPop = { d: elapsed - pbSplits[i], t: now, last: i === ROOMS.length - 1 };
+  sfx(splitPop.d < 0 ? 'ahead' : 'behind');
+}
 function hazardTime(now){
   if (state === 'race' || state === 'dead' || state === 'done') return elapsed;
   if (state === 'count') return 0;
@@ -1411,6 +1566,7 @@ function uiCursor(now){
 function update(now){
   const dt = Math.max(0, Math.min(0.05, (now - lastNow) / 1000)); lastNow = now;
   if (toastT && now > toastT){ toastT = 0; H.toast.hidden = true; }
+  if (state !== 'mp' && state !== 'count' && state !== 'race' && state !== 'dead'){ hazardCues(null); sfxWind(0, false); countN = -1; } // 走っていない画面では障害物の音と風を止める
   if (state === 'mp'){ mpUpdate(now, dt); return; }
   if (state === 'board'){ boardUpdate(now, dt); return; }
   if (state === 'lab'){ labUpdate(now, dt); return; }
@@ -1422,9 +1578,10 @@ function update(now){
   const env = { t: ht, dt, cur, prev: hadCur ? prevCur : null, have, speed, history };
   if (state !== 'menu') stepPieces(room.pieces, env);
   const ps = state === 'menu' ? [] : prims(room, ht, env);
+  if (state === 'count' || state === 'race' || state === 'dead') hazardCues(boardKey(course) + '/' + roomIdx, room.pieces, ht, have ? cur : null);
 
   for (const s of samples){
-    if (s.out){ if (state === 'race') die('out'); else if (state === 'count'){ state = 'title'; falseStarts++; flyFlash = 1; setMsg(); } have = false; continue; }
+    if (s.out){ if (state === 'race') die('out'); else if (state === 'count'){ state = 'title'; falseStarts++; flyFlash = 1; sfx('fault'); setMsg(); } have = false; continue; }
     have = true;
     if (state === 'race'){
       const h = sweepHit(ps, cur.x, cur.y, s.x, s.y);
@@ -1433,8 +1590,8 @@ function update(now){
     cur = s;
     if (state === 'count' || state === 'race') dropDot(trail, cur.x, cur.y, now); // 尻尾は自機のときだけ
     if (state === 'title'){ if (dist(cur, START) < T.PAD_R){ state = 'count'; countEnd = now + T.COUNTDOWN * 1000; setMsg(); } }
-    else if (state === 'count'){ if (dist(cur, START) > T.PAD_R){ state = 'title'; falseStarts++; flyFlash = 1; setMsg(); } }
-    else if (state === 'dead'){ if (dist(cur, cp) < T.PAD_R * 0.8) state = 'race'; }
+    else if (state === 'count'){ if (dist(cur, START) > T.PAD_R){ state = 'title'; falseStarts++; flyFlash = 1; sfx('fault'); setMsg(); } }
+    else if (state === 'dead'){ if (dist(cur, cp) < T.PAD_R * 0.8){ state = 'race'; sfx('revive'); } }
   }
   samples.length = 0;
   if (state === 'menu'){
@@ -1452,17 +1609,23 @@ function update(now){
   env.cur = cur; env.have = have; env.speed = speed;
   if (state === 'race' && have){ history.push({ x: cur.x, y: cur.y, t: elapsed }); while (history.length && history[0].t < elapsed - 10) history.shift(); }
 
-  if (state === 'count' && now >= countEnd){ state = 'race'; goTime = now; elapsed = 0; gRec = []; gLastT = -1; history = []; resetPieceState(); for (const g of raceGhosts){ g.gi = 0; g.trail = []; } }
+  if (state === 'count'){ const n = Math.ceil((countEnd - now) / 1000); if (n !== countN){ countN = n; if (n > 0) sfx('tick'); } } else countN = -1; // カウントダウンの1秒ごと
+  if (state === 'count' && now >= countEnd){ state = 'race'; goTime = now; elapsed = 0; gRec = []; gLastT = -1; history = []; resetPieceState(); for (const g of raceGhosts){ g.gi = 0; g.trail = []; } sfx('go'); }
   if (state === 'race' && have){
     // 静止中に突っ込んでくる障害物、区画ルール
     const h = sweepHit(ps, cur.x, cur.y, cur.x, cur.y) || ruleHit(room.pieces, env); if (h) die(h);
-  }
-  if (state === 'race'){
-    for (const c of room.cps){ if (dist(cur, c) < T.PAD_R && !cpsHit.has(c)){ cpsHit.add(c); cp = c; } }
-    if (dist(cur, room.exit) < T.PAD_R){
-      if (roomIdx === ROOMS.length - 1) finish(); else { splits.push(elapsed); enterRoom(roomIdx + 1); }
+    else if (elapsed - grazeT >= T.GRAZE_GAP && grazeHit(ps, cur)){ // かすり: 音と火花だけ
+      grazeT = elapsed; grazes++; sfx('graze');
+      for (let i = 0; i < 5; i++){ const a = Math.random() * TAU, v = 80 + Math.random() * 180; particles.push({ x: cur.x, y: cur.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.18 + Math.random() * 0.15, c: '#fff' }); }
     }
   }
+  if (state === 'race'){
+    for (const c of room.cps){ if (dist(cur, c) < T.PAD_R && !cpsHit.has(c)){ cpsHit.add(c); cp = c; sfx('cp'); } }
+    if (dist(cur, room.exit) < T.PAD_R){
+      if (roomIdx === ROOMS.length - 1) finish(); else { splits.push(elapsed); sfx('room', { n: roomIdx }); popSplit(roomIdx, now); enterRoom(roomIdx + 1); }
+    }
+  }
+  sfxWind(speed, state === 'race' && have);
   // ゴースト記録
   if ((state === 'race' || state === 'dead') && elapsed - gLastT >= 1 / T.GHOST_HZ){ gLastT = elapsed; gRec.push(Math.round(elapsed * 1000), roomIdx, Math.round(cur.x), Math.round(cur.y), state === 'race' ? 1 : 0); }
 
@@ -1521,11 +1684,12 @@ function mpMsg(m){
       if (m.phase === 'place') MP.drag = null;
       if (m.phase === 'box' || m.phase === 'lobby') MP.status = 'idle';
       if (m.phase === 'results' || m.phase === 'final') for (const id in MP.others) MP.others[id].trail = [];
+      if (prev) sfx(m.phase === 'run' ? 'go' : m.phase === 'final' ? 'best' : m.phase === 'box' || m.phase === 'place' ? 'cp' : 'click'); // 局面の切り替わり
     }
     for (const id in MP.others) if (!m.players.some(p => p.id === id)) delete MP.others[id];
   }
   else if (m.t === 'pos'){ const o = MP.others[m.id] || (MP.others[m.id] = { x: m.x, y: m.y, trail: [] }); o.x = m.x; o.y = m.y; dropDot(o.trail, m.x, m.y, performance.now()); }
-  else if (m.t === 'reject') mpNote('そこには置けない');
+  else if (m.t === 'reject'){ mpNote('そこには置けない'); sfx('fault'); }
   else if (m.t === 'full') mpNote('部屋が満員です（M でメニュー）', Infinity);
 }
 function mpKeyReady(){ if (MP.snap && MP.snap.phase === 'lobby') mpSend({ t: 'ready' }); }
@@ -1537,7 +1701,7 @@ function mpHazardTime(){
   return serverNow() / 1000; // 設置中はサーバー時刻で同期したプレビュー
 }
 function mpDie(h){
-  MP.status = 'dead'; deaths++;
+  MP.status = 'dead'; deaths++; sfx('die');
   mpSend({ t: 'dead', by: h && h.src && h.src.owner ? h.src.owner : null });
   burst(MP.me ? MP.me.color : '#5ee1ff');
 }
@@ -1565,7 +1729,9 @@ function mpUpdate(now, dt){
   if (phase === 'run' && have){ history.push({ x: cur.x, y: cur.y, t: ht }); while (history.length && history[0].t < ht - 10) history.shift(); }
   if (phase === 'run' && MP.status === 'running' && have){ const h = sweepHit(ps, cur.x, cur.y, cur.x, cur.y); if (h) mpDie(h); else { const r = ruleHit(level, env); if (r) mpDie({ src: r }); } }
   if (phase === 'run' && MP.status === 'waiting' && have && dist(cur, MP_START) < T.PAD_R){ MP.status = 'running'; mpSend({ t: 'start' }); }
-  if (phase === 'run' && MP.status === 'running' && dist(cur, MP_GOAL) < T.PAD_R){ MP.status = 'finished'; mpSend({ t: 'finish' }); }
+  if (phase === 'run' && MP.status === 'running' && dist(cur, MP_GOAL) < T.PAD_R){ MP.status = 'finished'; mpSend({ t: 'finish' }); sfx('finish'); }
+  hazardCues(phase === 'run' && s ? 'mp/' + s.round : null, level, ht, have ? cur : null); sfxWind(speed, phase === 'run' && MP.status === 'running' && have);
+  if (phase === 'count'){ const n = Math.ceil(Math.max(0, (s.deadline - serverNow()) / 1000)); if (n !== countN){ countN = n; if (n > 0) sfx('tick'); } } else countN = -1;
   const canPlace = phase === 'place' && MP.me && MP.me.pick !== null && !MP.me.placed;
   for (const c of clicks){
     if (!s) continue;
@@ -1969,6 +2135,14 @@ function drawSingle(now, room, ps, ht, layer){
     drawTrail(trail, C.player, 0.9, now); drawCursor(now, C.player, state === 'dead');
     if (have){
       if (debug){ ctx.beginPath(); ctx.arc(cur.x, cur.y, T.HEAD_R, 0, TAU); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
+    }
+    if (splitPop && now - splitPop.t < 2600 && (state === 'race' || state === 'dead' || state === 'done')){ // 部屋を抜けた瞬間: 自己ベストとの差
+      const u = (now - splitPop.t) / 2600, d = splitPop.d, y = 70 - 14 * Math.max(0, 1 - u * 8);
+      ctx.save(); ctx.globalAlpha = u < 0.75 ? 1 : Math.max(0, (1 - u) * 4);
+      ctx.shadowColor = '#000'; ctx.shadowBlur = 8;
+      text((d < 0 ? '−' : '+') + fmt(Math.abs(d)), T.W / 2, y, 44, d < 0 ? C.start : C.haz, 'center');
+      text(splitPop.last ? 'BEST との差' : 'BEST との差（ここまで）', T.W / 2, y + 34, 13, C.fg, 'center', 500);
+      ctx.restore();
     }
     if (course.shakeLab){ // 振動ラボ: いまの設定と操作
       panel(330, 664, 620, 40);
