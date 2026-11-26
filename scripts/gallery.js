@@ -8,6 +8,8 @@ const dates = process.argv.slice(2).length ? process.argv.slice(2) : ['2026-11-2
 (async () => {
   const browser = await chromium.launch({ executablePath: exe, headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.addInitScript(() => { try { localStorage.setItem('cursorrun.seen', '1'); } catch (e) {} }); // 初回の「あそびかた」は出さない
   const errors = []; page.on('pageerror', e => errors.push(String(e)));
   await page.goto(pathToFileURL(path.join(root, 'index.html')).href);
   await page.waitForFunction(() => { const c = DAILIES.get(today()); return c && !c.building; });

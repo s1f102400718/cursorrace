@@ -15,6 +15,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await new Promise(res => srv.stdout.on('data', d => { if (String(d).includes('server:')) res(); }));
   const browser = await chromium.launch({ executablePath: exe, headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  await page.addInitScript(() => { try { localStorage.setItem('cursorrun.seen', '1'); } catch (e) {} }); // 初回の「あそびかた」は出さない
   const errors = [];
   page.on('console', m => { if (m.type() === 'error' && !/fonts\.g|net::ERR|Failed to load resource/.test(m.text())) errors.push(m.text()); });
   page.on('pageerror', e => errors.push(String(e)));

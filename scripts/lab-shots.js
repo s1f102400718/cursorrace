@@ -8,6 +8,8 @@ const only = process.argv.slice(2);
 (async () => {
   const browser = await chromium.launch({ executablePath: exe, headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.addInitScript(() => { try { localStorage.setItem('cursorrun.seen', '1'); } catch (e) {} }); // 初回の「あそびかた」は出さない
   const errors = []; page.on('pageerror', e => errors.push(String(e))); page.on('console', m => { if (m.type() === 'error' && !/fonts\.g|net::ERR|Failed to load/.test(m.text())) errors.push(m.text()); });
   await page.goto(pathToFileURL(path.join(root, 'index.html')).href);
   await page.waitForFunction(() => typeof LABS !== 'undefined');

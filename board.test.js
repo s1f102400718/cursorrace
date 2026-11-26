@@ -3,14 +3,14 @@
 //  B) ゲーム2人ぶんを本物のサーバーにつなぐ: 1人が完走 → もう1人の表に出る → ゴーストを取って並走できる
 //  C) 公開アーティファクトの共有DB（window.claude の代用品）でも同じ流れが回る
 const fs = require('fs'), os = require('os'), path = require('path'), { spawn } = require('child_process');
-const { load } = require('./harness.js');
+const { load, botPath } = require('./harness.js');
 const PORT = 8125, BASE = `http://localhost:${PORT}/`, DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cursorrun-'));
 let fail = 0; const ok = (c, msg) => { if (!c){ fail++; console.log('  NG', msg); } return c; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const realFetch = global.fetch, api = (u, init) => realFetch(BASE + u, init);
 const post = (key, body) => api('api/board/' + key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
 function startServer(){ return new Promise(res => { const p = spawn(process.execPath, [path.join(__dirname, 'server.js')], { env: { ...process.env, PORT, DATA_DIR: DATA }, stdio: ['ignore', 'pipe', 'inherit'] }); p.stdout.on('data', d => { if (String(d).includes('server:')) res(p); }); }); }
-const NAMES = ['COURSES', 'DAILIES', 'BOARD', 'NET', 'WATCH', 'ME', 'buildDaily', 'today', 'encodeGhost', 'decodeGhost', 'openDaily', 'openBoard', 'play', 'update', 'samples', 'boardKey', 'boardRows', 'loadRec', 'ghostFor', 'boardAct', 'toggleSel', 'setName', 'syncRec', 'state', 'raceGhosts', 'course'];
+const NAMES = ['COURSES', 'DAILIES', 'BOARD', 'NET', 'WATCH', 'ME', 'buildDaily', 'today', 'encodeGhost', 'decodeGhost', 'openDaily', 'openBoard', 'play', 'update', 'samples', 'boardKey', 'boardRows', 'loadRec', 'ghostFor', 'boardAct', 'toggleSel', 'setName', 'syncRec', 'state', 'raceGhosts', 'course', 'solveRoom'];
 // BOT の経路でコースを完走させる
 function finishRun(g, clock, course, raw){
   g.DAILIES.set(course.daily.date, course); g.openDaily(course.daily.date); clock.t += 16; g.update(clock.t);
@@ -46,7 +46,10 @@ const pump = async (g, clock, n = 12) => { for (let i = 0; i < n; i++){ await sl
   r = await post(key, { pid: 'p-cccccc', token: 'tokentoken-c', name: 'C', t: 5000, d: 0, g: g2 }); ok(!r.ok, 'タイムとゴーストの長さが合わなければ拒否');
   r = await post(key, { pid: 'p-cccccc', token: 'tokentoken-c', name: '', t: 15000, d: 0, g: g2 }); ok(!r.ok, '名前なしは拒否');
   r = await post('d-2020-01-01-g1-deadbeef', { pid: 'p-cccccc', token: 'tokentoken-c', name: 'C', t: 15000, d: 0, g: g2 }); ok(!r.ok && /受付/.test(r.err), '過去のデイリーは拒否');
-  r = await post('c-normal-v0_2', { pid: 'p-cccccc', token: 'tokentoken-c', name: 'C', t: 15000, d: 0, g: g2 }); ok(r.ok, '固定コースはいつでも登録できる');
+  r = await post('c-normal-v0_2', { pid: 'p-cccccc', token: 'tokentoken-c', name: 'C', t: 15000, d: 0, g: g2 }); ok(!r.ok && /確かめられません/.test(r.err), '別のコースの走りは拒否（サーバーが走りを確かめる）');
+  const nb = botPath(base.m, base.m.COURSES[0].rooms, base.m.COURSES[0].start), nt = Math.round(nb.time * 1000);
+  r = await post('c-normal-v0_2', { pid: 'p-cccccc', token: 'tokentoken-c', name: 'C', t: nt, d: 0, g: base.m.encodeGhost(nb.bot, nt) }); ok(r.ok, '固定コースはいつでも登録できる: ' + r.err);
+  r = await post('c-normal-v9_9', { pid: 'p-cccccc', token: 'tokentoken-c', name: 'C', t: nt, d: 0, g: base.m.encodeGhost(nb.bot, nt) }); ok(!r.ok && /読み込み直して/.test(r.err), '知らないコースは拒否');
   const gh = await (await api(`api/ghost/${key}/p-bbbbbb`)).json(); ok(gh.g === g2, 'ゴーストが取れる');
   ok((await api(`api/ghost/${key}/p-zzzzzz`)).status === 404, '無いゴーストは 404');
   ok((await api('data/boards/' + key + '.json')).status === 404, '保存ファイルは配信しない');

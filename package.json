@@ -1,12 +1,17 @@
 {
   "name": "cursor-run",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.9.0",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js && node pieces.test.js && node daily.test.js && node shake.test.js && node elements.test.js && node sound.test.js && node board.test.js && node e2e.js && node smoke.js",
+    "test": "node test.js && node pieces.test.js && node daily.test.js && node shake.test.js && node elements.test.js && node sound.test.js && node verify.test.js && node server.test.js && node board.test.js && node e2e.js && node smoke.js",
     "shots": "node scripts/shots.js",
-    "build": "node scripts/build-artifact.js"
+    "check": "npm test && node scripts/shots.js && node scripts/cursor-shots.js && node scripts/sound-shots.js && node scripts/release-shots.js",
+    "build": "node scripts/build-artifact.js",
+    "build:web": "node scripts/build-web.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

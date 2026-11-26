@@ -10,7 +10,7 @@ global.window = { innerWidth: 1600, innerHeight: 900, devicePixelRatio: 1, addEv
 global.getComputedStyle = () => ({ getPropertyValue: () => '#000' });
 global.localStorage = { getItem: () => null, setItem(){} };
 let t = 0; global.performance = { now: () => t }; global.requestAnimationFrame = () => {};
-global.location = { protocol: 'http:', host: 'localhost:' + PORT, search: '?name=A' };
+global.location = { protocol: 'http:', host: 'localhost:' + PORT, search: '?name=A&room=main' };
 global.WebSocket = WebSocket; global.URLSearchParams = URLSearchParams;
 const errors = []; global.console = { ...console, error: e => errors.push(String(e && e.stack || e)) };
 const C = new Function(js + ';return { mpEnter, update, MP, clicks, ups, samples, get state(){ return state; } };')();

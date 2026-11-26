@@ -1,0 +1,14 @@
+.git
+node_modules
+data
+dist
+test-out
+sandbox
+scripts
+*.test.js
+e2e.js
+smoke.js
+test.js
+*.md
+*.log
+start.cmd

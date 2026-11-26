@@ -1,12 +1,36 @@
 'use strict';
-// Cursor Run マルチプレイサーバー（Ultimate Chicken Horse 方式）
+// Cursor Run サーバー: ゲームの配信、ランキング（デイリー／固定コース）、マルチプレイ（Ultimate Chicken Horse 方式）
 //   npm install && node server.js  →  http://localhost:8080/?room=abc
-// サーバーの役割: フェーズ進行、箱（ピース候補）の生成、設置の受理と検証、レースクロック、採点。
-// 当たり判定は各クライアントが行い、死亡/ゴールを申告する（身内用、チート耐性なし）。
-const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
+// マルチでのサーバーの役割: フェーズ進行、箱（ピース候補）の生成、設置の受理と検証、レースクロック、採点。
+// マルチの当たり判定は各クライアントが行い、死亡/ゴールを申告する（マルチは身内で遊ぶ前提のまま）。
+//
+// 外に公開するときの守り（どれも環境変数で調整）:
+//   配信するのは PUBLIC_FILES だけ（設計書・テスト・このファイルは出さない）。SERVE_ALL=1 で開発用に全部配信
+//   TRUST_PROXY=<前段のプロキシの数>  相手の IP を X-Forwarded-For から取る（Cloudflare Tunnel や PaaS の後ろでは 1）
+//   ADMIN_TOKEN=<合言葉>              管理用 API（/api/admin/…）を有効にする。未設定なら無効
+//   VERIFY=0                          記録の検証（verify.js）を切る（開発用）
+//   LIMITS=0                          回数制限を切る（負荷試験・開発用）
+const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 const { WebSocketServer } = require('ws');
+const { courseFor, verifyRun } = require('./verify.js');
 
 const PORT = process.env.PORT || 8080;
+const ENV = { serveAll: process.env.SERVE_ALL === '1', trustProxy: Math.max(0, parseInt(process.env.TRUST_PROXY, 10) || 0), admin: process.env.ADMIN_TOKEN || '', verify: process.env.VERIFY !== '0', limits: process.env.LIMITS !== '0' };
+// 回数の上限。[回数, 秒]。IP ごと（WS のメッセージは接続ごと）。学校や会社のように1つの IP を大勢で使う回線でも足りる程度に取ってある
+const LIM = { get: [900, 60], post: [40, 60], newPid: [40, 86400], wsMsg: [90, 1], wsJoin: [20, 60], wsPerIp: 8, wsTotal: 800, rooms: 300, boardsInMemory: 300, ghostDays: 30 };
+const hits = new Map(); // 種類|相手 → { n, t }
+function allow(kind, who, lim){
+  if (!ENV.limits) return true;
+  const k = kind + '|' + who, now = Date.now(); let b = hits.get(k);
+  if (!b || now - b.t >= lim[1] * 1000){ b = { n: 0, t: now }; hits.set(k, b); }
+  return ++b.n <= lim[0];
+}
+setInterval(() => { const now = Date.now(); for (const [k, b] of hits) if (now - b.t > 86400000 || (now - b.t > 120000 && !k.startsWith('newPid|'))) hits.delete(k); }, 60000).unref();
+function ipOf(req){
+  if (ENV.trustProxy){ const cf = req.headers['cf-connecting-ip']; if (typeof cf === 'string' && cf) return cf.slice(0, 64);
+    const xs = String(req.headers['x-forwarded-for'] || '').split(',').map(v => v.trim()).filter(Boolean); if (xs.length) return xs[Math.max(0, xs.length - ENV.trustProxy)].slice(0, 64); }
+  return req.socket.remoteAddress || '?';
+}
 const T = {
   W: 1280, H: 720, PAD_R: 46,
   BOX: 12000, PLACE: 25000, COUNT: 3000, RUN: 45000, RESULTS: 8000, FINAL: 12000,
@@ -188,7 +212,7 @@ class Room {
   onMsg(p, m){
     switch (m.t){
       case 'ready': if (this.phase === 'lobby'){ p.ready = !p.ready; this.sync(); if (this.players.size >= 1 && this.all(q => q.ready)) this.startGame(); } break;
-      case 'pick': if (this.phase === 'box' && p.pick === null){ const b = this.box[m.i]; if (b && b.takenBy === null){ b.takenBy = p.id; p.pick = m.i; this.sync(); if (this.all(q => q.pick !== null)) this.startPlace(); } } break;
+      case 'pick': if (this.phase === 'box' && p.pick === null && Number.isInteger(m.i)){ const b = this.box[m.i]; if (b && b.takenBy === null){ b.takenBy = p.id; p.pick = m.i; this.sync(); if (this.all(q => q.pick !== null)) this.startPlace(); } } break;
       case 'place': if (this.phase === 'place' && p.pick !== null && !p.placed){
           const b = this.box[p.pick], piece = b ? materialize(b.piece, m) : null;
           if (piece && placementOk(piece)){
@@ -222,22 +246,26 @@ class Room {
 //   POST /api/board/<key>         ← { pid, token, name, t, d, g }  → { ok, rows } | { ok:false, err }
 //   GET  /api/ghost/<key>/<pid>   → { g }
 // 保存先は DATA_DIR（既定 ./data）。boards/<key>.json と ghosts/<key>/<pid>.txt。
-// タイムの正しさは検証しない（身内用）。防ぐのは「他人の記録の上書き」と「壊れたデータ」だけ。
+// 受け付けるのは知っているコース（固定コースと当日のデイリー）の、verify.js の検証を通った記録だけ。
+// 行には sus（検証で数えた怪しい点の数）も残す。外には出さず、管理用 API で見る。
 const DATA = process.env.DATA_DIR || path.join(__dirname, 'data');
 const RANK = { TZ_MIN: 540, GRACE: 15 * 60000, MAX_ROWS: 500, MAX_G: 110000, MAX_BODY: 200000, GH_HZ: 30, GH_MAX: 18000 };
 const boards = new Map(); // key → Map(pid → { pid, name, t, d, ts, th })
 const keyOk = k => /^[\w-]{3,64}$/.test(k), pidOk = p => /^[\w-]{6,40}$/.test(p);
 const dayKeyAt = ms => new Date(ms + RANK.TZ_MIN * 60000).toISOString().slice(0, 10);
-function boardOf(key){
+function boardOf(key, create){ // 表。ファイルも無く create でもなければ null（でたらめな識別子で覚える量を増やされないように）
   let b = boards.get(key);
-  if (!b){ b = new Map(); try { for (const e of JSON.parse(fs.readFileSync(path.join(DATA, 'boards', key + '.json'), 'utf8'))) b.set(e.pid, e); } catch (e) {} boards.set(key, b); }
+  if (b){ boards.delete(key); boards.set(key, b); return b; } // 使った順に並べ直す
+  try { b = new Map(); for (const e of JSON.parse(fs.readFileSync(path.join(DATA, 'boards', key + '.json'), 'utf8'))) if (e && pidOk(e.pid)) b.set(e.pid, e); } catch (e) { b = null; }
+  if (!b){ if (!create) return null; b = new Map(); }
+  boards.set(key, b); while (boards.size > LIM.boardsInMemory) boards.delete(boards.keys().next().value);
   return b;
 }
 function saveBoard(key){
   const dir = path.join(DATA, 'boards'), fp = path.join(dir, key + '.json');
-  fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(fp + '.tmp', JSON.stringify([...boardOf(key).values()])); fs.renameSync(fp + '.tmp', fp);
+  fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(fp + '.tmp', JSON.stringify([...boardOf(key, true).values()])); fs.renameSync(fp + '.tmp', fp);
 }
-const sorted = key => [...boardOf(key).values()].sort((a, b) => a.t - b.t || a.ts - b.ts);
+const sorted = key => [...(boardOf(key) || new Map()).values()].sort((a, b) => a.t - b.t || a.ts - b.ts);
 const rowsOf = key => sorted(key).slice(0, 100).map(e => ({ pid: e.pid, name: e.name, t: e.t, d: e.d, ts: e.ts }));
 const ghostFile = (key, pid) => path.join(DATA, 'ghosts', key, pid + '.txt');
 // ゴーストの形だけ確かめる: 版1・30Hz・長さがヘッダーと合う・長さがタイムと合う
@@ -247,79 +275,152 @@ function ghostOk(g, t){
   const n = b[2] | b[3] << 8; if (b.length !== 4 + n * 3) return false;
   return n === RANK.GH_MAX || Math.abs((n - 1) * 1000 / RANK.GH_HZ - t) < 1500;
 }
-function submitScore(key, m){
+function submitScore(key, m, ip){
   const now = Date.now(), day = /^d-(\d{4}-\d\d-\d\d)-/.exec(key);
   // デイリーは当日(JST)だけ受け付ける。日付をまたいだ直後の走りのために少しだけ猶予を持つ
   if (day && day[1] !== dayKeyAt(now) && day[1] !== dayKeyAt(now - RANK.GRACE)) return { ok: false, err: 'このデイリーの受付は終わりました' };
   const pid = String(m.pid || ''), token = String(m.token || ''), t = Math.round(+m.t), d = Math.round(+m.d), name = String(m.name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 12);
   if (!pidOk(pid) || token.length < 8 || token.length > 80 || !name || !(t >= 500 && t <= 3600000) || !(d >= 0 && d <= 9999) || !ghostOk(m.g, t)) return { ok: false, err: '記録の形式が正しくありません' };
-  const b = boardOf(key), th = crypto.createHash('sha256').update(token).digest('hex'), cur = b.get(pid);
+  const course = ENV.verify ? courseFor(key) : null;
+  if (ENV.verify && !course) return { ok: false, err: 'コースが新しくなっています。ページを読み込み直してください' };
+  const b = boardOf(key, true), th = crypto.createHash('sha256').update(token).digest('hex'), cur = b.get(pid);
   if (cur && cur.th !== th) return { ok: false, err: 'この記録は別の端末のものです' };
   if (cur && t >= cur.t && cur.name === name) return { ok: true, rows: rowsOf(key) };
+  let sus = cur ? cur.sus | 0 : 0;
+  if (!cur || t < cur.t){ // タイムを載せる・縮めるときだけ走りを確かめる（名前だけの変更では確かめ直さない）
+    if (!cur && !allow('newPid', ip, LIM.newPid)) return { ok: false, err: 'この接続からの新しい登録が多すぎます。明日また試してください' };
+    if (course){ const v = verifyRun(course, m.g, t, d); if (!v.ok){ console.log(`[verify] ${key} ${pid} ${t}ms: ${v.why}`); return { ok: false, err: '走りを確かめられませんでした（' + v.why + '）' }; } sus = v.sus; }
+  }
   if (!cur && b.size >= RANK.MAX_ROWS){ // 満員なら最下位と入れ替え
     const worst = sorted(key).pop(); if (t >= worst.t) return { ok: false, err: 'ランキングが満員です' };
     b.delete(worst.pid); try { fs.unlinkSync(ghostFile(key, worst.pid)); } catch (e) {}
   }
   if (!cur || t < cur.t){
     fs.mkdirSync(path.dirname(ghostFile(key, pid)), { recursive: true }); fs.writeFileSync(ghostFile(key, pid), m.g);
-    b.set(pid, { pid, name, t, d, ts: now, th });
+    b.set(pid, { pid, name, t, d, ts: now, th, sus });
   } else cur.name = name; // タイムは据え置きで名前だけ変更
   saveBoard(key);
   return { ok: true, rows: rowsOf(key) };
 }
+// 古いデイリーのゴーストを消す（行は残す）。起動時と6時間ごと
+function pruneGhosts(){
+  const lim = dayKeyAt(Date.now() - LIM.ghostDays * 86400000); let dirs = [];
+  try { dirs = fs.readdirSync(path.join(DATA, 'ghosts')); } catch (e) { return; }
+  for (const k of dirs){ const m = /^d-(\d{4}-\d\d-\d\d)-/.exec(k); if (m && m[1] < lim){ try { fs.rmSync(path.join(DATA, 'ghosts', k), { recursive: true, force: true }); } catch (e) {} } }
+}
+pruneGhosts(); setInterval(pruneGhosts, 6 * 3600000).unref();
+function removeRow(key, pid){ // 管理用: 1行とそのゴーストを消す
+  const b = boardOf(key); if (!b || !b.has(pid)) return false;
+  b.delete(pid); try { fs.unlinkSync(ghostFile(key, pid)); } catch (e) {} saveBoard(key); return true;
+}
+function isAdmin(req){
+  if (!ENV.admin) return false; const h = String(req.headers.authorization || ''), tok = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const a = crypto.createHash('sha256').update(tok).digest(), b = crypto.createHash('sha256').update(ENV.admin).digest(); return crypto.timingSafeEqual(a, b);
+}
+function readJson(req, res, json, cb){ // 本文を上限つきで読む
+  let body = '', over = false;
+  req.on('data', ch => { if (over) return; body += ch; if (body.length > RANK.MAX_BODY){ over = true; json(413, { ok: false, err: 'データが大きすぎます' }); req.destroy(); } });
+  req.on('end', () => { if (over) return; let m; try { m = JSON.parse(body); } catch (e) { return json(400, { ok: false, err: '記録の形式が正しくありません' }); }
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return json(400, { ok: false, err: '記録の形式が正しくありません' });
+    try { cb(m); } catch (e) { console.error(e); json(500, { ok: false, err: 'サーバーで保存に失敗しました' }); } });
+}
 function api(req, res, parts){
-  const json = (code, o) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o)); };
-  const [what, key, pid] = parts;
-  if (what === 'ping' && parts.length === 1) return json(200, { cursorrun: 1, now: Date.now() });
+  const json = (code, o) => { if (res.headersSent) return; res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); res.end(JSON.stringify(o)); };
+  const [what, key, pid] = parts, ip = ipOf(req), post = req.method === 'POST';
+  if (req.method !== 'GET' && !post) return json(405, { err: 'method not allowed' });
+  if (!allow(post ? 'post' : 'get', ip, post ? LIM.post : LIM.get)) return json(429, { ok: false, err: 'アクセスが多すぎます。少し待ってからもう一度' });
+  if (what === 'ping' && parts.length === 1 && !post) return json(200, { cursorrun: 1, now: Date.now() });
   if (what === 'board' && parts.length === 2 && keyOk(key)){
-    if (req.method === 'GET') return json(200, { now: Date.now(), rows: rowsOf(key) });
-    if (req.method === 'POST'){
-      let body = '', over = false;
-      req.on('data', ch => { if (over) return; body += ch; if (body.length > RANK.MAX_BODY){ over = true; json(413, { ok: false, err: 'データが大きすぎます' }); req.destroy(); } });
-      req.on('end', () => { if (over) return; let m; try { m = JSON.parse(body); } catch (e) { return json(400, { ok: false, err: '記録の形式が正しくありません' }); }
-        try { const r = submitScore(key, m || {}); json(r.ok ? 200 : 400, { now: Date.now(), ...r }); } catch (e) { console.error(e); json(500, { ok: false, err: 'サーバーで保存に失敗しました' }); } });
-      return;
-    }
+    if (!post) return json(200, { now: Date.now(), rows: rowsOf(key) });
+    return readJson(req, res, json, m => { const r = submitScore(key, m, ip); json(r.ok ? 200 : 400, { now: Date.now(), ...r }); });
   }
-  if (what === 'ghost' && parts.length === 3 && keyOk(key) && pidOk(pid) && req.method === 'GET'){
+  if (what === 'ghost' && parts.length === 3 && keyOk(key) && pidOk(pid) && !post){
     try { return json(200, { g: fs.readFileSync(ghostFile(key, pid), 'utf8') }); } catch (e) { return json(404, { err: 'not found' }); }
+  }
+  // ---- 管理用（ADMIN_TOKEN を設定したときだけ）。Authorization: Bearer <合言葉> ----
+  if (what === 'admin' && ENV.admin){
+    if (!isAdmin(req)) return json(401, { err: 'unauthorized' });
+    if (key === 'boards' && parts.length === 2 && !post){ let files = []; try { files = fs.readdirSync(path.join(DATA, 'boards')).filter(f => f.endsWith('.json')).map(f => f.slice(0, -5)); } catch (e) {} return json(200, { boards: files.sort().reverse().map(k => ({ key: k, rows: (boardOf(k) || new Map()).size })) }); }
+    if (key === 'board' && parts.length === 3 && keyOk(pid) && !post) return json(200, { key: pid, rows: sorted(pid).map(e => ({ pid: e.pid, name: e.name, t: e.t, d: e.d, ts: e.ts, sus: e.sus | 0 })) }); // sus つきの全行
+    if (key === 'remove' && parts.length === 2 && post) return readJson(req, res, json, m => { const ok = keyOk(String(m.key)) && pidOk(String(m.pid)) && removeRow(String(m.key), String(m.pid)); if (ok) console.log(`[admin] removed ${m.key} ${m.pid}`); json(ok ? 200 : 404, { ok }); });
   }
   json(404, { err: 'not found' });
 }
 
 // ---- HTTP (静的配信) + WebSocket ----
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.md': 'text/plain; charset=utf-8', '.json': 'application/json' };
+// 外に出すのは PUBLIC_FILES だけ。index.html の <script> と同じ中身だけを実行できるようにする（CSP）。
+const PUBLIC_FILES = { '/': 'index.html', '/index.html': 'index.html', '/og.png': 'og.png', '/robots.txt': 'robots.txt' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.md': 'text/plain; charset=utf-8', '.json': 'application/json', '.png': 'image/png', '.txt': 'text/plain; charset=utf-8', '.svg': 'image/svg+xml' };
+const cache = new Map(); // ファイル → { mtime, raw, gz, csp }
+function fileOf(fp){
+  const st = fs.statSync(fp), c = cache.get(fp); if (c && c.mtime === st.mtimeMs) return c;
+  const raw = fs.readFileSync(fp), ext = path.extname(fp), e = { mtime: st.mtimeMs, raw, gz: /\.(html|js|md|json|txt|svg)$/.test(ext) ? zlib.gzipSync(raw) : null, csp: '' };
+  if (ext === '.html'){ // ページに書いてある <script> だけを許す（ハッシュ）。差し込まれたスクリプトは動かない
+    // ブラウザは改行を LF にそろえてからハッシュを取るので、ここでもそろえる（Windows で取り出したファイルは CRLF になっている）
+    const hashes = [...raw.toString('utf8').replace(/\r\n?/g, '\n').matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => "'sha256-" + crypto.createHash('sha256').update(m[1]).digest('base64') + "'");
+    e.csp = `default-src 'self'; script-src ${hashes.join(' ') || "'none'"}; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'none'; form-action 'none'`;
+  }
+  cache.set(fp, e); return e;
+}
 const server = http.createServer((req, res) => {
-  let file; try { file = decodeURIComponent(req.url.split('?')[0]); } catch (e) { res.writeHead(400); res.end('bad request'); return; }
-  if (file.startsWith('/api/')) return api(req, res, file.slice(5).split('/'));
-  if (file === '/') file = '/index.html';
-  const fp = path.join(__dirname, path.normalize(file));
-  if (/^\/(data|node_modules)(\/|$)|\/\./.test(file)){ res.writeHead(404); res.end('not found'); return; } // 記録の保存先などは配信しない
-  if (!fp.startsWith(__dirname) || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()){ res.writeHead(404); res.end('not found'); return; }
-  res.writeHead(200, { 'Content-Type': MIME[path.extname(fp)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
-  fs.createReadStream(fp).pipe(res);
+  try {
+    let file; try { file = decodeURIComponent(String(req.url).split('?')[0]); } catch (e) { res.writeHead(400); res.end('bad request'); return; }
+    if (file.startsWith('/api/')) return api(req, res, file.slice(5).split('/'));
+    if (req.method !== 'GET' && req.method !== 'HEAD'){ res.writeHead(405); res.end('method not allowed'); return; }
+    const notFound = () => { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('not found'); };
+    if (!allow('get', ipOf(req), LIM.get)){ res.writeHead(429); res.end('too many requests'); return; }
+    let fp = null;
+    if (Object.prototype.hasOwnProperty.call(PUBLIC_FILES, file)) fp = path.join(__dirname, PUBLIC_FILES[file]);
+    else if (ENV.serveAll && !/^\/(data|node_modules)(\/|$)|\/\./.test(file)){ const q = path.join(__dirname, path.normalize(file)); if (q.startsWith(__dirname + path.sep)) fp = q; } // 開発用: 記録の保存先など以外は全部
+    if (!fp || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()) return notFound();
+    const e = fileOf(fp), gz = e.gz && /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+    const head = { 'Content-Type': MIME[path.extname(fp)] || 'application/octet-stream', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Vary': 'Accept-Encoding' };
+    if (e.csp) head['Content-Security-Policy'] = e.csp;
+    if (gz) head['Content-Encoding'] = 'gzip';
+    const body = gz ? e.gz : e.raw; head['Content-Length'] = body.length;
+    res.writeHead(200, head); res.end(req.method === 'HEAD' ? undefined : body);
+  } catch (err) { console.error(err); try { if (!res.headersSent) res.writeHead(500); res.end('error'); } catch (e2) {} }
 });
-const wss = new WebSocketServer({ server });
-wss.on('connection', ws => {
-  let room = null, player = null;
+server.headersTimeout = 10000; server.requestTimeout = 20000; server.keepAliveTimeout = 5000; // 遅く送り続けて接続を占有する相手への備え
+const wss = new WebSocketServer({ server, maxPayload: 2048 });
+const wsByIp = new Map();
+wss.on('connection', (ws, req) => {
+  const ip = ipOf(req), nIp = (wsByIp.get(ip) || 0) + 1;
+  if (ENV.limits && (nIp > LIM.wsPerIp || wss.clients.size > LIM.wsTotal)){ try { ws.send(JSON.stringify({ t: 'full' })); } catch (e) {} ws.close(); return; }
+  wsByIp.set(ip, nIp); ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
+  let room = null, player = null; const cid = crypto.randomBytes(4).toString('hex');
+  ws.on('error', () => {});
   ws.on('message', data => {
-    let m; try { m = JSON.parse(data); } catch (e) { return; }
-    if (!player){
-      if (m.t !== 'join') return;
-      const code = String(m.room || 'main').replace(/[^\w-]/g, '').slice(0, 24) || 'main';
-      room = rooms.get(code) || (rooms.set(code, new Room(code)), rooms.get(code));
-      if (room.players.size >= 8){ ws.send(JSON.stringify({ t: 'full' })); ws.close(); return; }
-      const used = new Set([...room.players.values()].map(p => p.color));
-      // 進行中の部屋に入った人は今のラウンドは見学（out）、次の箱から参加
-      player = { id: crypto.randomBytes(4).toString('hex'), name: String(m.name || 'player').slice(0, 12), color: COLORS.find(c => !used.has(c)) || COLORS[0], ws, score: 0, ready: false, status: room.phase === 'lobby' ? 'idle' : 'out', pick: null, placed: true, finishTime: null };
-      room.players.set(player.id, player);
-      ws.send(JSON.stringify({ t: 'hello', id: player.id, now: Date.now() }));
-      room.sync();
-      console.log(`[${code}] + ${player.name} (${room.players.size})`);
-      return;
-    }
-    room.onMsg(player, m);
+    try {
+      if (!allow('wsMsg', cid, LIM.wsMsg)){ ws.close(); return; } // 1秒に送れる数を超えた接続は切る
+      let m; try { m = JSON.parse(data); } catch (e) { return; }
+      if (!m || typeof m !== 'object' || typeof m.t !== 'string') return;
+      if (!player){
+        if (m.t !== 'join') return;
+        if (!allow('wsJoin', ip, LIM.wsJoin)){ ws.send(JSON.stringify({ t: 'full' })); ws.close(); return; }
+        const code = String(m.room || 'main').replace(/[^\w-]/g, '').slice(0, 24) || 'main';
+        if (!rooms.has(code) && rooms.size >= LIM.rooms){ ws.send(JSON.stringify({ t: 'full' })); ws.close(); return; }
+        room = rooms.get(code) || (rooms.set(code, new Room(code)), rooms.get(code));
+        if (room.players.size >= 8){ ws.send(JSON.stringify({ t: 'full' })); ws.close(); room = null; return; }
+        const used = new Set([...room.players.values()].map(p => p.color));
+        const name = String(m.name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 12) || 'player';
+        // 進行中の部屋に入った人は今のラウンドは見学（out）、次の箱から参加
+        player = { id: crypto.randomBytes(4).toString('hex'), name, color: COLORS.find(c => !used.has(c)) || COLORS[0], ws, score: 0, ready: false, status: room.phase === 'lobby' ? 'idle' : 'out', pick: null, placed: true, finishTime: null };
+        room.players.set(player.id, player);
+        ws.send(JSON.stringify({ t: 'hello', id: player.id, now: Date.now() }));
+        room.sync();
+        console.log(`[${code}] + ${player.name} (${room.players.size})`);
+        return;
+      }
+      room.onMsg(player, m);
+    } catch (err) { console.error(err); }
   });
-  ws.on('close', () => { if (room && player){ room.leave(player); console.log(`[${room.code}] - ${player.name}`); } });
+  ws.on('close', () => {
+    const left = (wsByIp.get(ip) || 1) - 1; if (left > 0) wsByIp.set(ip, left); else wsByIp.delete(ip);
+    if (room && player){ try { room.leave(player); } catch (err) { console.error(err); } console.log(`[${room.code}] - ${player.name}`); }
+  });
 });
-server.listen(PORT, () => console.log(`Cursor Run server: http://localhost:${PORT}/?room=main`));
+// 応答のない接続を片づける（30秒ごとに ping）
+setInterval(() => { for (const ws of wss.clients){ if (!ws.isAlive){ ws.terminate(); continue; } ws.isAlive = false; try { ws.ping(); } catch (e) {} } }, 30000).unref();
+process.on('uncaughtException', err => { console.error('[uncaught]', err); }); // 1件のおかしな入力で全員を落とさない
+server.listen(PORT, () => console.log(`Cursor Run server: http://localhost:${PORT}/?room=main${ENV.serveAll ? ' (SERVE_ALL)' : ''}${ENV.admin ? ' (admin on)' : ''}`));

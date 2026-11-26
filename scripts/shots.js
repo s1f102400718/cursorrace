@@ -15,7 +15,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await new Promise(res => srv.stdout.on('data', d => { if (String(d).includes('server:')) res(); }));
   // 他プレイヤーの記録。BOTの経路を時間方向に引き伸ばしたもの（見た目の確認用なので障害物とは合っていない）
   const base = load(['buildDaily', 'today', 'encodeGhost'], { wall: Date.now() }), today = base.m.today(), course = base.m.buildDaily(today);
-  const others = [['ねこ42', 1.45, 0], ['うま17', 1.62, 1], ['きつね88', 1.9, 0], ['くま03', 2.3, 2], ['かえる55', 2.75, 4], ['さる71', 3.4, 3], ['いぬ29', 4.1, 7]];
+  const others = [['ねこ42', 1.45, 0], ['うま17', 1.62, 1], ['きつね88', 1.9, 0], ['くま03', 2.3, 2], ['かえる55', 2.75, 3], ['さる71', 3.4, 3], ['いぬ29', 4.1, 2]]; // 死亡数は 0〜3: サーバーが走りと照らし合わせるので、やられた跡のない見本では大きくできない
   for (const [name, k, d] of others){
     const s = course.bot.map((v, i) => i % 5 === 0 ? Math.round(v * k) : v), t = Math.round(course.par * 1000 * k);
     const r = await (await fetch(BASE + 'api/board/' + course.key, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid: 'seed-' + Math.round(k * 100), token: 'seed-token-' + name, name, t, d, g: base.m.encodeGhost(s, t) }) })).json();
@@ -24,6 +24,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const browser = await chromium.launch({ executablePath: exe, headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.addInitScript(() => { try { localStorage.setItem('cursorrun.seen', '1'); } catch (e) {} }); // 初回の「あそびかた」は出さない
   const errors = [];
   page.on('console', m => { if (m.type() === 'error' && !/fonts\.g|net::ERR|Failed to load resource/.test(m.text())) errors.push(m.text()); });
   page.on('response', r => { if (r.status() >= 400 && !/favicon\.ico$/.test(r.url())) errors.push(r.status() + ' ' + r.url()); }); // 読み込み失敗はURLつきで拾う

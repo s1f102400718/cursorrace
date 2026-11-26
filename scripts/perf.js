@@ -7,6 +7,8 @@ const exe = ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:
 (async () => {
   const browser = await chromium.launch({ executablePath: exe, headless: true, args: ['--enable-gpu'] });
   const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.addInitScript(() => { try { localStorage.setItem('cursorrun.seen', '1'); } catch (e) {} }); // 初回の「あそびかた」は出さない
   await page.goto(pathToFileURL(path.join(root, 'index.html')).href);
   await page.waitForFunction(() => typeof LABS !== 'undefined');
   const measure = (code, depth) => page.evaluate(async ([code, depth]) => {
